@@ -1,0 +1,126 @@
+{
+  "project_name": "CVLN Wallet",
+  "theme": "dark",
+  "core_philosophy": "Ultra-premium fintech digital wallet, combining the minimalist trust of Qonto with the cutting-edge tech aesthetics of Revolut Premium. Dark mode native with deep violet and metallic cyan accents. Heavy use of layered depth, subtle glassmorphism, and architectural typography.",
+  "typography": {
+    "headings": {
+      "font_family": "Cabinet Grotesk",
+      "import_url": "@import url('https://api.fontshare.com/v2/css?f[]=cabinet-grotesk@800,500,700,400&display=swap');",
+      "usage": "Use for all Main Titles (Dashboard, Wallet, Solde Total), FREK-ID scores, and major numeric balances.",
+      "tracking": "tracking-tight"
+    },
+    "body_data": {
+      "font_family": "Manrope",
+      "import_url": "@import url('https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700&display=swap');",
+      "usage": "Use for transaction tables, labels, body text, and UI components. Exceptional for tabular numbers."
+    },
+    "scale": {
+      "h1": "text-4xl sm:text-5xl lg:text-6xl font-extrabold tracking-tighter",
+      "h2": "text-2xl sm:text-3xl lg:text-4xl font-bold tracking-tight",
+      "balance": "text-5xl sm:text-6xl font-black tracking-tighter",
+      "body": "text-base leading-relaxed",
+      "label": "text-xs font-semibold tracking-[0.2em] uppercase text-zinc-400"
+    }
+  },
+  "colors": {
+    "background": {
+      "app": "#09090F",
+      "sidebar": "#050508",
+      "card": "#12121A",
+      "card_hover": "#1A1A24"
+    },
+    "brand": {
+      "primary": "#8B5CF6",
+      "primary_hover": "#7C3AED",
+      "secondary": "#00F0FF",
+      "accent": "#F5D0FE"
+    },
+    "text": {
+      "primary": "#FFFFFF",
+      "secondary": "#A1A1AA",
+      "muted": "#71717A"
+    },
+    "status": {
+      "success": "#10B981",
+      "warning": "#F59E0B",
+      "danger": "#EF4444"
+    },
+    "gradients": {
+      "beam": "bg-gradient-to-r from-transparent via-[#8B5CF6] to-transparent",
+      "vault": "bg-gradient-to-br from-[#12121A] to-[#8B5CF6]/10"
+    }
+  },
+  "visual_enhancers": {
+    "borders": "1px solid border-white/10 (use border-white/20 on hover). Cards must never have pure white borders.",
+    "glassmorphism": "backdrop-blur-2xl bg-[#09090F]/70 border-b border-white/10",
+    "shadows": {
+      "glow": "shadow-[0_0_15px_rgba(139,92,246,0.15)]",
+      "ambient": "shadow-lg shadow-black/50"
+    }
+  },
+  "layouts_and_grids": {
+    "dashboard_bento": "grid-cols-1 md:grid-cols-3 lg:grid-cols-4 gap-6. Dashboard balance taking col-span-2 or 3.",
+    "spacing_system": "Generous spacing. p-6 or p-8 inside cards. gap-6 between dashboard widgets.",
+    "sidebar": "Fixed width (260px), sticky, borders on right side (border-white/10). Active menu item has bg-white/5 and bright left border."
+  },
+  "component_guidelines": {
+    "cards": "Flat background (#12121A), border-white/10, rounded-3xl. Add 'overflow-hidden' for internal glowing effects or structural gradients.",
+    "buttons": {
+      "primary": "bg-violet-600 hover:bg-violet-500 text-white rounded-full px-6 py-3 font-semibold shadow-glow transition-all",
+      "quick_action": "flex flex-col items-center justify-center p-4 bg-white/5 hover:bg-white/10 rounded-2xl border border-white/5 hover:border-white/15 transition-all gap-2"
+    },
+    "tables": "Transaction tables should have hover states on rows (hover:bg-white/5). Align amounts to the right. Use neutral tones for amounts, relying on simple minus signs or muted greens for inflow to remain premium.",
+    "progress_bars": "For 'Coffres'. Height 8px, rounded-full, bg-zinc-800, fill bg-gradient-to-r from-violet-500 to-cyan-400."
+  },
+  "motion_and_interactions": {
+    "hover_states": "Cards lift (-translate-y-1) and gain subtle border glow.",
+    "buttons": "Scale down on tap (active:scale-95).",
+    "page_transitions": "Framer motion opacity 0 to 1, y: 10 to 0 on mount.",
+    "list_stagger": "Transaction list items stagger in on load."
+  },
+  "media_and_icons": {
+    "icon_library": "@phosphor-icons/react (Duotone or regular weight for premium feel)",
+    "image_urls": {
+      "abstract_background": {
+        "url": "https://images.pexels.com/photos/7505924/pexels-photo-7505924.jpeg?auto=compress&cs=tinysrgb&dpr=2&h=650&w=940",
+        "description": "Abstract fluid dark texture for premium login/auth screen background or hero banner underlay."
+      },
+      "avatar_frekid": {
+        "url": "https://images.pexels.com/photos/31880922/pexels-photo-31880922.jpeg?auto=compress&cs=tinysrgb&dpr=2&h=650&w=940",
+        "description": "Professional headshot for the FREK-ID user profile and certification."
+      },
+      "vault_3d_glass": {
+        "url": "https://images.pexels.com/photos/11382581/pexels-photo-11382581.jpeg?auto=compress&cs=tinysrgb&dpr=2&h=650&w=940",
+        "description": "Abstract 3D curved glass shape for the Coffres (Vaults) visual decoration to add a premium aesthetic."
+      }
+    }
+  },
+  "accessibility": {
+    "contrast": "Ensure text-muted against #12121A meets at least 4.5:1 ratio.",
+    "focus": "Use focus:ring-2 focus:ring-violet-500 focus:outline-none for interactive elements.",
+    "testing": "All interactive and key informational elements MUST include a data-testid attribute (e.g., data-testid='send-money-btn', data-testid='total-balance')."
+  },
+  "instructions_to_main_agent": [
+    "DO NOT use generic Inter font. Import and use Cabinet Grotesk (headings) and Manrope (body).",
+    "DO NOT use pure white borders. Always use border-white/10 or border-white/5.",
+    "Build the dashboard using a Bento Grid approach. Ensure high density but with generous padding (p-6/p-8) inside the cards.",
+    "Ensure 'Convertir' shows the EUR to JCC rate (1 JCC = 1.50 EUR) beautifully.",
+    "Use Phosphor icons. Add animations to quick action buttons on hover.",
+    "Implement Sonner for toast notifications (e.g., successful conversion or sending JCC).",
+    "FREK Score should visually represent a premium credit rating (e.g., glowing circular indicator or minimal gauge).",
+    "Never use generic 🤖🧠 emojis. Strictly rely on Phosphor Icons.",
+    "Do not center-align the main application container text. Left-align text for readability."
+  ],
+  "UNIVERSAL_GUIDELINES_FOR_MAIN_AGENT": [
+    "Avoid generic, 'on distribution' outputs. Do not create generic centered layouts or simplistic gradients.",
+    "Create depth through layered design elements with z-index hierarchy and glassmorphism.",
+    "MUST NOT apply universal transition (e.g., transition: all). Apply specific transitions.",
+    "MUST NOT center align the app container in css.",
+    "Always use modern button styles (pill-shaped or rounded-full with interaction animations).",
+    "NEVER use emojis for icons. Use Phosphor Icons.",
+    "Every interaction needs micro-animations - hover states, transitions.",
+    "Use 2-3x more spacing than feels comfortable. Cramped designs look cheap.",
+    "Include subtle grain textures or noise overlays for a premium look.",
+    "Always apply data-testid to interactive elements."
+  ]
+}
