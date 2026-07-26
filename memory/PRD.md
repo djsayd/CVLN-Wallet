@@ -12,3 +12,10 @@ Premium fintech wallet (Revolut/Qonto style) for CVLN Group cultural ecosystem. 
 - P1: QR scan, Pay flow, real Stripe top-up for Acheter CC
 - P1: webhooks for entity API, rate limiting on API keys
 - P2: charts, notifications persistence
+
+## Update 2026-06 — Money integrity + Stripe
+- New accounts start at 0 CC (no fake money); min deposit enforced.
+- EUR->CC via Stripe Checkout (multi-currency); CC credited only after payment confirmed (poll + webhook /api/stripe/webhook).
+- Withdrawals CC->bank = payout requests (pending) validated by admin; refund on reject. Real IBAN payouts need Stripe Connect at go-live.
+- Admin back-office (ADMIN_EMAIL=djsayd972@gmail.com): settings (rate, min deposit, reserve), stats, withdrawal approve/reject.
+- Stripe sandbox provisioned (Flow A). Onboarding pending KYC.

@@ -1,77 +1,33 @@
-import { useEffect, useState } from "react";
-import { toast } from "sonner";
+import { useNavigate } from "react-router-dom";
 import { motion } from "framer-motion";
-import { ArrowsDownUp } from "@phosphor-icons/react";
-import api, { fmt } from "@/lib/api";
-import { useAuth } from "@/context/AuthContext";
-
-const RATE = 1.5;
+import { Plus, Bank, ArrowsLeftRight } from "@phosphor-icons/react";
 
 export default function Convertir() {
-  const { checkAuth } = useAuth();
-  const [wallet, setWallet] = useState(null);
-  const [dir, setDir] = useState("eur_to_jcc"); // or jcc_to_eur
-  const [amount, setAmount] = useState("");
-  const [loading, setLoading] = useState(false);
-
-  const load = async () => setWallet((await api.get("/wallet")).data);
-  useEffect(() => { load(); }, []);
-
-  const eurToJcc = dir === "eur_to_jcc";
-  const amt = parseFloat(amount) || 0;
-  const result = eurToJcc ? amt / RATE : amt * RATE;
-  const fromLabel = eurToJcc ? "€" : "CC";
-  const toLabel = eurToJcc ? "CC" : "€";
-
-  const swap = () => { setDir(eurToJcc ? "jcc_to_eur" : "eur_to_jcc"); setAmount(""); };
-
-  const convert = async () => {
-    if (!amt) return toast.error("Entrez un montant");
-    setLoading(true);
-    try {
-      const res = await api.post("/convert", { direction: dir, amount: amt });
-      toast.success("Conversion réussie", { description: eurToJcc ? `+${fmt(res.data.received_cc, 2)} CC` : `+${fmt(res.data.received_eur, 2)} €` });
-      setAmount(""); await load(); await checkAuth();
-    } catch (e) { toast.error(e.response?.data?.detail || "Erreur"); }
-    finally { setLoading(false); }
-  };
-
+  const navigate = useNavigate();
   return (
     <div className="space-y-6 max-w-2xl">
       <div>
         <h1 className="font-display text-3xl sm:text-4xl font-extrabold tracking-tight">Convertir</h1>
-        <p className="text-zinc-400 mt-1">Taux fixe · <span className="text-violet-400 font-semibold">1 JCC = 1,50 €</span></p>
+        <p className="text-zinc-400 mt-1">Toute opération en devise passe par <span className="text-violet-400 font-semibold">Stripe</span>. Taux : 1 JCC = 1,50 €.</p>
       </div>
 
-      <motion.div initial={{ opacity: 0, y: 12 }} animate={{ opacity: 1, y: 0 }} className="rounded-3xl border border-white/10 bg-[#12121A] p-7 sm:p-8">
-        <div className="rounded-2xl bg-white/5 border border-white/10 p-5">
-          <div className="text-xs font-semibold tracking-widest uppercase text-zinc-500 mb-2">Vous convertissez</div>
-          <div className="flex items-center gap-3">
-            <input type="number" value={amount} onChange={(e) => setAmount(e.target.value)} placeholder="0"
-              className="bg-transparent outline-none font-display text-4xl font-black tracking-tight w-full text-white placeholder:text-zinc-600" data-testid="convert-amount" autoFocus />
-            <span className="font-display text-2xl font-bold text-violet-400">{fromLabel}</span>
-          </div>
-          {!eurToJcc && <div className="text-xs text-zinc-500 mt-2">Disponible : {fmt(wallet?.balance_cc)} CC</div>}
-        </div>
+      <div className="rounded-3xl border border-white/10 bg-[#12121A] p-7 flex items-center gap-4">
+        <ArrowsLeftRight size={28} className="text-violet-400" />
+        <p className="text-sm text-zinc-300">Chaque CC est adossé à un vrai encaissement : impossible de créer de la monnaie. Les entrées se font par dépôt Stripe, les sorties par retrait bancaire validé.</p>
+      </div>
 
-        <div className="flex justify-center -my-3 relative z-10">
-          <button onClick={swap} data-testid="swap-direction" className="w-12 h-12 rounded-full bg-violet-600 hover:bg-violet-500 flex items-center justify-center glow-violet active:scale-90 transition-transform border-4 border-[#12121A]">
-            <ArrowsDownUp size={22} weight="bold" />
-          </button>
-        </div>
-
-        <div className="rounded-2xl bg-white/5 border border-white/10 p-5">
-          <div className="text-xs font-semibold tracking-widest uppercase text-zinc-500 mb-2">Vous recevez</div>
-          <div className="flex items-center gap-3">
-            <div className="font-display text-4xl font-black tracking-tight w-full text-cyan-400" data-testid="convert-result">{fmt(result, 2)}</div>
-            <span className="font-display text-2xl font-bold text-cyan-400">{toLabel}</span>
-          </div>
-        </div>
-
-        <button onClick={convert} disabled={loading} className="w-full mt-6 py-3.5 rounded-full bg-gradient-to-r from-violet-600 to-violet-500 font-semibold glow-violet hover:from-violet-500 active:scale-95 transition-transform disabled:opacity-50" data-testid="convert-submit">
-          Convertir
-        </button>
-      </motion.div>
+      <div className="grid grid-cols-1 sm:grid-cols-2 gap-5">
+        <motion.button whileHover={{ y: -4 }} onClick={() => navigate("/wallet")} className="rounded-3xl border border-white/10 bg-gradient-to-br from-violet-600/20 to-[#12121A] p-7 text-left" data-testid="go-deposit">
+          <span className="w-11 h-11 rounded-xl bg-cyan-500/15 text-cyan-300 flex items-center justify-center"><Plus size={22} weight="bold" /></span>
+          <h3 className="font-display text-xl font-bold mt-4">Déposer (EUR → CC)</h3>
+          <p className="text-sm text-zinc-400 mt-1">Paiement carte via Stripe, multi-devises.</p>
+        </motion.button>
+        <motion.button whileHover={{ y: -4 }} onClick={() => navigate("/wallet")} className="rounded-3xl border border-white/10 bg-gradient-to-br from-emerald-600/15 to-[#12121A] p-7 text-left" data-testid="go-withdraw">
+          <span className="w-11 h-11 rounded-xl bg-emerald-500/15 text-emerald-300 flex items-center justify-center"><Bank size={22} weight="bold" /></span>
+          <h3 className="font-display text-xl font-bold mt-4">Retirer (CC → EUR)</h3>
+          <p className="text-sm text-zinc-400 mt-1">Virement vers votre compte bancaire.</p>
+        </motion.button>
+      </div>
     </div>
   );
 }

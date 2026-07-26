@@ -19,6 +19,23 @@ mongo_url = os.environ['MONGO_URL']
 client = AsyncIOMotorClient(mongo_url)
 db = client[os.environ['DB_NAME']]
 
+import stripe
+stripe.api_key = os.environ.get("STRIPE_SECRET_KEY") or "sk_test_emergent"
+STRIPE_WEBHOOK_SECRET = os.environ.get("STRIPE_WEBHOOK_SECRET", "")
+ADMIN_EMAIL = os.environ.get("ADMIN_EMAIL", "")
+
+async def get_settings():
+    s = await db.settings.find_one({"key": "app"}, {"_id": 0})
+    if not s:
+        s = {"key": "app", "rate_eur": 1.5, "min_deposit_eur": 20.0, "reserve_cc": 0.0, "total_deposited_eur": 0.0}
+        await db.settings.insert_one(dict(s))
+    return s
+
+async def require_admin(user: dict = None):
+    if not user or not user.get("is_admin"):
+        raise HTTPException(status_code=403, detail="Réservé à l'administrateur")
+    return user
+
 app = FastAPI()
 api_router = APIRouter(prefix="/api")
 
@@ -100,24 +117,10 @@ async def seed_user_data(user_id: str):
             "coffre_id": f"coffre_{uuid.uuid4().hex[:10]}",
             "user_id": user_id,
             "created_at": now.isoformat(),
-            **c,
+            **{**c, "amount_cc": 0},
         })
     if coffres:
         await db.coffres.insert_many(coffres)
-    txs = []
-    for t in SEED_TX:
-        ts = now - timedelta(days=t["days"], hours=random.randint(0, 10))
-        txs.append({
-            "tx_id": f"tx_{uuid.uuid4().hex[:10]}",
-            "user_id": user_id,
-            "label": t["label"],
-            "amount": t["amount"],
-            "category": t["category"],
-            "type": "in" if t["amount"] > 0 else "out",
-            "created_at": ts.isoformat(),
-        })
-    if txs:
-        await db.transactions.insert_many(txs)
 
 
 async def add_transaction(user_id: str, label: str, amount: float, category: str):
@@ -153,7 +156,7 @@ async def create_session(request: Request, response: Response):
     existing = await db.users.find_one({"email": email}, {"_id": 0})
     if existing:
         user_id = existing["user_id"]
-        await db.users.update_one({"user_id": user_id}, {"$set": {"name": data.get("name"), "picture": data.get("picture")}})
+        await db.users.update_one({"user_id": user_id}, {"$set": {"name": data.get("name"), "picture": data.get("picture"), "is_admin": email == ADMIN_EMAIL}})
     else:
         user_id = f"user_{uuid.uuid4().hex[:12]}"
         frek_id = f"FREK-{uuid.uuid4().hex[:4].upper()}-{random.randint(1000,9999)}"
@@ -165,7 +168,8 @@ async def create_session(request: Request, response: Response):
             "frek_id": frek_id,
             "frek_score": random.randint(920, 985),
             "frek_level": "Créateur Premium",
-            "balance_cc": 154280.0,
+            "balance_cc": 0.0,
+            "is_admin": email == ADMIN_EMAIL,
             "created_at": datetime.now(timezone.utc).isoformat(),
         })
         await seed_user_data(user_id)
@@ -238,29 +242,13 @@ async def send_money(req: SendRequest, user: dict = Depends(get_current_user)):
 
 
 @api_router.post("/actions/buy")
-async def buy_cc(req: BuyRequest, user: dict = Depends(get_current_user)):
-    if req.amount_eur <= 0:
-        raise HTTPException(status_code=400, detail="Montant invalide")
-    cc = round(req.amount_eur / JCC_RATE_EUR, 2)
-    tx = await add_transaction(user["user_id"], f"Achat de CC ({req.amount_eur} €)", cc, "Dépôt")
-    return {"ok": True, "cc": cc, "transaction": tx}
+async def buy_cc_deprecated(user: dict = Depends(get_current_user)):
+    raise HTTPException(status_code=400, detail="Achat désactivé : utilisez le dépôt Stripe.")
 
 
 @api_router.post("/convert")
 async def convert(req: ConvertRequest, user: dict = Depends(get_current_user)):
-    if req.amount <= 0:
-        raise HTTPException(status_code=400, detail="Montant invalide")
-    if req.direction == "eur_to_jcc":
-        cc = round(req.amount / JCC_RATE_EUR, 2)
-        tx = await add_transaction(user["user_id"], f"Conversion {req.amount} € → CC", cc, "Conversion")
-        return {"ok": True, "received_cc": cc, "transaction": tx}
-    elif req.direction == "jcc_to_eur":
-        if req.amount > user.get("balance_cc", 0):
-            raise HTTPException(status_code=400, detail="Solde CC insuffisant")
-        eur = round(req.amount * JCC_RATE_EUR, 2)
-        tx = await add_transaction(user["user_id"], f"Conversion {req.amount} CC → EUR", -req.amount, "Conversion")
-        return {"ok": True, "received_eur": eur, "transaction": tx}
-    raise HTTPException(status_code=400, detail="Direction invalide")
+    raise HTTPException(status_code=400, detail="Conversion via Stripe : utilisez Dépôt (EUR→CC) ou Retrait (CC→EUR).")
 
 
 # ---------------- Coffres ----------------
@@ -477,6 +465,160 @@ async def seed_entities():
         })
     if docs:
         await db.entities.insert_many(docs)
+
+
+# ================= STRIPE DEPOSITS / WITHDRAWALS / ADMIN =================
+class DepositRequest(BaseModel):
+    amount: float
+    currency: str = "eur"
+    origin_url: str
+
+class WithdrawRequest(BaseModel):
+    amount_cc: float
+    iban: Optional[str] = ""
+
+class SettingsUpdate(BaseModel):
+    rate_eur: Optional[float] = None
+    min_deposit_eur: Optional[float] = None
+    reserve_cc: Optional[float] = None
+
+async def credit_deposit(rec: dict):
+    await add_transaction(rec["user_id"], f"Dépôt Stripe ({rec['amount']} {rec['currency'].upper()})", rec["credit_cc"], "Dépôt")
+    await db.settings.update_one({"key": "app"}, {"$inc": {"total_deposited_eur": rec.get("eur_equiv", 0)}})
+
+@api_router.post("/payments/checkout")
+async def payments_checkout(req: DepositRequest, user: dict = Depends(get_current_user)):
+    st = await get_settings()
+    if req.amount < st["min_deposit_eur"]:
+        raise HTTPException(status_code=400, detail=f"Dépôt minimum {st['min_deposit_eur']} € (ou équivalent).")
+    rate = st["rate_eur"]
+    credit_cc = round(req.amount / rate, 2)
+    session = stripe.checkout.Session.create(
+        line_items=[{"price_data": {"currency": req.currency.lower(),
+            "product_data": {"name": f"Dépôt CVLN Wallet — {credit_cc} CC"},
+            "unit_amount": int(round(req.amount * 100))}, "quantity": 1}],
+        mode="payment",
+        success_url=f"{req.origin_url}/payment/success?session_id={{CHECKOUT_SESSION_ID}}",
+        cancel_url=f"{req.origin_url}/wallet",
+        metadata={"user_id": user["user_id"], "credit_cc": str(credit_cc), "kind": "deposit"},
+    )
+    await db.payment_transactions.insert_one({
+        "session_id": session.id, "user_id": user["user_id"], "credit_cc": credit_cc,
+        "amount": req.amount, "currency": req.currency.lower(), "eur_equiv": req.amount,
+        "status": "initiated", "payment_status": "pending",
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    })
+    return {"checkout_url": session.url, "session_id": session.id}
+
+@api_router.get("/payments/status/{session_id}")
+async def payments_status(session_id: str):
+    rec = await db.payment_transactions.find_one({"session_id": session_id}, {"_id": 0})
+    if not rec:
+        raise HTTPException(status_code=404, detail="Transaction introuvable")
+    if rec.get("payment_status") != "paid":
+        try:
+            s = stripe.checkout.Session.retrieve(session_id)
+            if s.payment_status == "paid" or s.status == "complete":
+                res = await db.payment_transactions.update_one(
+                    {"session_id": session_id, "payment_status": {"$ne": "paid"}},
+                    {"$set": {"status": "completed", "payment_status": "paid"}})
+                if res.modified_count == 1:
+                    await credit_deposit(rec)
+                rec = await db.payment_transactions.find_one({"session_id": session_id}, {"_id": 0})
+        except Exception:
+            pass
+    return {"session_id": session_id, "status": rec["status"], "payment_status": rec["payment_status"], "credit_cc": rec.get("credit_cc")}
+
+@api_router.post("/stripe/webhook")
+async def stripe_webhook(request: Request):
+    payload = await request.body()
+    sig = request.headers.get("stripe-signature", "")
+    try:
+        event = stripe.Webhook.construct_event(payload, sig, STRIPE_WEBHOOK_SECRET)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid signature")
+    if event["type"] == "checkout.session.completed":
+        obj = event["data"]["object"]
+        rec = await db.payment_transactions.find_one({"session_id": obj["id"]}, {"_id": 0})
+        if rec:
+            res = await db.payment_transactions.update_one(
+                {"session_id": obj["id"], "payment_status": {"$ne": "paid"}},
+                {"$set": {"status": "completed", "payment_status": "paid"}})
+            if res.modified_count == 1:
+                await credit_deposit(rec)
+    return {"status": "ok"}
+
+# ---- Withdrawals (payout requests, real bank via Stripe Connect at go-live) ----
+@api_router.post("/withdrawals")
+async def create_withdrawal(req: WithdrawRequest, user: dict = Depends(get_current_user)):
+    if req.amount_cc <= 0:
+        raise HTTPException(status_code=400, detail="Montant invalide")
+    if req.amount_cc > user.get("balance_cc", 0):
+        raise HTTPException(status_code=400, detail="Solde insuffisant")
+    st = await get_settings()
+    eur = round(req.amount_cc * st["rate_eur"], 2)
+    await add_transaction(user["user_id"], f"Retrait demandé — {req.amount_cc} CC", -req.amount_cc, "Retrait")
+    doc = {"wd_id": f"wd_{uuid.uuid4().hex[:10]}", "user_id": user["user_id"], "user_name": user.get("name"),
+           "frek_id": user.get("frek_id"), "amount_cc": req.amount_cc, "amount_eur": eur,
+           "iban": req.iban, "status": "pending", "created_at": datetime.now(timezone.utc).isoformat()}
+    await db.withdrawals.insert_one(doc)
+    doc.pop("_id", None)
+    return {"ok": True, "withdrawal": doc}
+
+@api_router.get("/withdrawals")
+async def my_withdrawals(user: dict = Depends(get_current_user)):
+    return await db.withdrawals.find({"user_id": user["user_id"]}, {"_id": 0}).sort("created_at", -1).to_list(100)
+
+# ---- Admin back-office ----
+@api_router.get("/admin/settings")
+async def admin_get_settings(user: dict = Depends(get_current_user)):
+    await require_admin(user)
+    return await get_settings()
+
+@api_router.put("/admin/settings")
+async def admin_set_settings(req: SettingsUpdate, user: dict = Depends(get_current_user)):
+    await require_admin(user)
+    upd = {k: v for k, v in req.dict().items() if v is not None}
+    if upd:
+        await db.settings.update_one({"key": "app"}, {"$set": upd}, upsert=True)
+    return await get_settings()
+
+@api_router.get("/admin/stats")
+async def admin_stats(user: dict = Depends(get_current_user)):
+    await require_admin(user)
+    users = await db.users.count_documents({})
+    circ = 0
+    async for u in db.users.find({}, {"balance_cc": 1}):
+        circ += u.get("balance_cc", 0)
+    st = await get_settings()
+    pending = await db.withdrawals.count_documents({"status": "pending"})
+    return {"users": users, "circulation_cc": circ, "circulation_eur": round(circ * st["rate_eur"], 2),
+            "total_deposited_eur": st.get("total_deposited_eur", 0), "pending_withdrawals": pending,
+            "rate_eur": st["rate_eur"], "reserve_cc": st.get("reserve_cc", 0)}
+
+@api_router.get("/admin/withdrawals")
+async def admin_withdrawals(user: dict = Depends(get_current_user)):
+    await require_admin(user)
+    return await db.withdrawals.find({}, {"_id": 0}).sort("created_at", -1).to_list(200)
+
+@api_router.post("/admin/withdrawals/{wd_id}/approve")
+async def admin_approve_wd(wd_id: str, user: dict = Depends(get_current_user)):
+    await require_admin(user)
+    wd = await db.withdrawals.find_one({"wd_id": wd_id}, {"_id": 0})
+    if not wd or wd["status"] != "pending":
+        raise HTTPException(status_code=404, detail="Demande introuvable ou déjà traitée")
+    await db.withdrawals.update_one({"wd_id": wd_id}, {"$set": {"status": "processed", "processed_at": datetime.now(timezone.utc).isoformat()}})
+    return {"ok": True}
+
+@api_router.post("/admin/withdrawals/{wd_id}/reject")
+async def admin_reject_wd(wd_id: str, user: dict = Depends(get_current_user)):
+    await require_admin(user)
+    wd = await db.withdrawals.find_one({"wd_id": wd_id}, {"_id": 0})
+    if not wd or wd["status"] != "pending":
+        raise HTTPException(status_code=404, detail="Demande introuvable ou déjà traitée")
+    await add_transaction(wd["user_id"], f"Retrait refusé — remboursement {wd['amount_cc']} CC", wd["amount_cc"], "Retrait")
+    await db.withdrawals.update_one({"wd_id": wd_id}, {"$set": {"status": "rejected", "processed_at": datetime.now(timezone.utc).isoformat()}})
+    return {"ok": True}
 
 
 app.include_router(api_router)

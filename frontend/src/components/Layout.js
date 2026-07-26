@@ -3,7 +3,7 @@ import { useState } from "react";
 import { motion } from "framer-motion";
 import {
   House, Wallet as WalletIcon, Receipt, Vault, ArrowsLeftRight,
-  Storefront, Planet, IdentificationCard, Gear, SignOut, List, X, MagnifyingGlass, Code,
+  Storefront, Planet, IdentificationCard, Gear, SignOut, List, X, MagnifyingGlass, Code, ShieldStar,
 } from "@phosphor-icons/react";
 import { useAuth } from "@/context/AuthContext";
 
@@ -23,6 +23,7 @@ const NAV = [
 function SidebarContent({ onNav }) {
   const { user, logout } = useAuth();
   const navigate = useNavigate();
+  const items = user?.is_admin ? [...NAV, { to: "/admin", label: "Admin", icon: ShieldStar }] : NAV;
   return (
     <div className="flex flex-col h-full">
       <div className="px-7 pt-8 pb-10">
@@ -32,7 +33,7 @@ function SidebarContent({ onNav }) {
         </div>
       </div>
       <nav className="flex-1 px-4 flex flex-col gap-1">
-        {NAV.map((item) => (
+        {items.map((item) => (
           <NavLink
             key={item.to}
             to={item.to}

@@ -15,6 +15,8 @@ import Marketplace from "@/pages/Marketplace";
 import Ecosysteme from "@/pages/Ecosysteme";
 import FrekId from "@/pages/FrekId";
 import Developers from "@/pages/Developers";
+import Admin from "@/pages/Admin";
+import PaymentSuccess from "@/pages/PaymentSuccess";
 import Parametres from "@/pages/Parametres";
 
 function AuthCallback() {
@@ -84,6 +86,8 @@ function AppRouter() {
         <Route path="/ecosysteme" element={<Ecosysteme />} />
         <Route path="/frek-id" element={<FrekId />} />
         <Route path="/developers" element={<Developers />} />
+        <Route path="/admin" element={<Admin />} />
+        <Route path="/payment/success" element={<PaymentSuccess />} />
         <Route path="/parametres" element={<Parametres />} />
       </Route>
       <Route path="*" element={<Navigate to="/" replace />} />
@@ -101,5 +105,6 @@ export default function App() {
     </BrowserRouter>
   );
 }
+
 
 
