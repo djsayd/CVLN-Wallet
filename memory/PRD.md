@@ -19,3 +19,11 @@ Premium fintech wallet (Revolut/Qonto style) for CVLN Group cultural ecosystem. 
 - Withdrawals CC->bank = payout requests (pending) validated by admin; refund on reject. Real IBAN payouts need Stripe Connect at go-live.
 - Admin back-office (ADMIN_EMAIL=djsayd972@gmail.com): settings (rate, min deposit, reserve), stats, withdrawal approve/reject.
 - Stripe sandbox provisioned (Flow A). Onboarding pending KYC.
+
+## Update 2026-06 — Agent Skills layer (P0)
+- Séparation admin/user: API entités + back-office + gestion agents = admin only (nav masquée + require_admin backend).
+- Registre de skills (Wallet.Balance, Assets.Portfolio, Payments.Request/Send, FREK.Identity, KORA.StreamIncome).
+- Scopes read/request/sign/execute/admin; agents avec token, spending_limit_cc, session_ttl, revoke.
+- Flow PREPARE(/agent/intent) -> CONFIRM(owner) -> EXECUTE; risk engine + preview + audit_logs.
+- Docs: docs/AGENTSKILL-WALLET-MAPPING.md, CVLN-WALLET-AGENTS.md, CVLN-WALLET-SECURITY.md.
+- Multi-chain BTC/ETH/SOL = préparé non activé (P2). Frontend Agents UI = P1.

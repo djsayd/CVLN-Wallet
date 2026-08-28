@@ -16,14 +16,18 @@ const NAV = [
   { to: "/marketplace", label: "Marketplace", icon: Storefront },
   { to: "/ecosysteme", label: "Écosystème", icon: Planet },
   { to: "/frek-id", label: "FREK-ID", icon: IdentificationCard },
-  { to: "/developers", label: "API", icon: Code },
   { to: "/parametres", label: "Paramètres", icon: Gear },
+];
+
+const ADMIN_NAV = [
+  { to: "/developers", label: "API", icon: Code },
+  { to: "/admin", label: "Admin", icon: ShieldStar },
 ];
 
 function SidebarContent({ onNav }) {
   const { user, logout } = useAuth();
   const navigate = useNavigate();
-  const items = user?.is_admin ? [...NAV, { to: "/admin", label: "Admin", icon: ShieldStar }] : NAV;
+  const items = user?.is_admin ? [...NAV, ...ADMIN_NAV] : NAV;
   return (
     <div className="flex flex-col h-full">
       <div className="px-7 pt-8 pb-10">

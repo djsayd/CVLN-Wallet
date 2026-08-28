@@ -436,10 +436,12 @@ async def v1_charge(req: EntityCharge, ent: dict = Depends(get_entity)):
 # ---- owner view (logged-in) ----
 @api_router.get("/entities")
 async def list_entities(user: dict = Depends(get_current_user)):
+    await require_admin(user)
     return await db.entities.find({}, {"_id": 0}).to_list(100)
 
 @api_router.post("/entities/{entity_id}/rotate-key")
 async def rotate_key(entity_id: str, user: dict = Depends(get_current_user)):
+    await require_admin(user)
     new_key = f"cvln_live_{uuid.uuid4().hex}"
     res = await db.entities.update_one({"entity_id": entity_id}, {"$set": {"api_key": new_key}})
     if res.matched_count == 0:
@@ -619,6 +621,164 @@ async def admin_reject_wd(wd_id: str, user: dict = Depends(get_current_user)):
     await add_transaction(wd["user_id"], f"Retrait refusé — remboursement {wd['amount_cc']} CC", wd["amount_cc"], "Retrait")
     await db.withdrawals.update_one({"wd_id": wd_id}, {"$set": {"status": "rejected", "processed_at": datetime.now(timezone.utc).isoformat()}})
     return {"ok": True}
+
+
+# ================= AGENT SKILLS LAYER (P0 — CC/JCC native) =================
+# Skill catalog: capabilities exposed to CVLN Agent Factory. Least-privilege by design.
+SKILLS = {
+    "Wallet.Balance":   {"capability": "read_balance",   "scopes": ["read"],                     "risk": "LOW",  "confirm": False, "networks": ["JCC"], "desc": "Lecture du solde CC/JCC."},
+    "Assets.Portfolio": {"capability": "read_portfolio",  "scopes": ["read"],                     "risk": "LOW",  "confirm": False, "networks": ["JCC"], "desc": "Lecture du portefeuille et des coffres."},
+    "Payments.Request": {"capability": "request_payment", "scopes": ["request"],                  "risk": "LOW",  "confirm": False, "networks": ["JCC"], "desc": "Préparer une demande de paiement (aucun fonds déplacé)."},
+    "Payments.Send":    {"capability": "send_asset",      "scopes": ["request", "sign", "execute"], "risk": "HIGH", "confirm": True,  "networks": ["JCC"], "desc": "Envoyer des CC à un FREK-ID. Déplace des fonds."},
+    "FREK.Identity":    {"capability": "read_identity",   "scopes": ["read"],                     "risk": "LOW",  "confirm": False, "networks": [],      "desc": "Interface FREKCORE (préparée) : lecture d'identité."},
+    "KORA.StreamIncome":{"capability": "prepare_income",  "scopes": ["request"],                  "risk": "MED",  "confirm": True,  "networks": ["JCC"], "desc": "Interface KORA (préparée) : préparer un versement de revenus créateur."},
+}
+SCOPE_ORDER = ["read", "request", "sign", "execute", "admin"]
+
+class AgentCreate(BaseModel):
+    name: str
+    scopes: List[str] = ["read"]
+    spending_limit_cc: float = 0.0
+    session_ttl_hours: int = 24
+
+class IntentCreate(BaseModel):
+    skill: str
+    params: dict = {}
+
+async def audit(actor: str, action: str, detail: dict):
+    await db.audit_logs.insert_one({"log_id": f"log_{uuid.uuid4().hex[:10]}", "actor": actor, "action": action,
+                                    "detail": detail, "created_at": datetime.now(timezone.utc).isoformat()})
+
+async def get_agent(request: Request) -> dict:
+    token = request.headers.get("X-Agent-Token")
+    if not token:
+        raise HTTPException(status_code=401, detail="Agent token manquant")
+    a = await db.agents.find_one({"agent_token": token}, {"_id": 0})
+    if not a or not a.get("active", True):
+        raise HTTPException(status_code=401, detail="Agent inconnu ou révoqué")
+    exp = datetime.fromisoformat(a["session_expires_at"])
+    if exp.tzinfo is None:
+        exp = exp.replace(tzinfo=timezone.utc)
+    if exp < datetime.now(timezone.utc):
+        await audit(a["agent_id"], "session_expired", {})
+        raise HTTPException(status_code=401, detail="Session agent expirée")
+    return a
+
+def has_scopes(agent: dict, required: List[str]) -> bool:
+    granted = set(agent.get("scopes", []))
+    return all(s in granted for s in required)
+
+# ---- Admin: manage agents ----
+@api_router.post("/admin/agents")
+async def create_agent(req: AgentCreate, user: dict = Depends(get_current_user)):
+    await require_admin(user)
+    token = f"agt_{uuid.uuid4().hex}"
+    doc = {"agent_id": f"agent_{uuid.uuid4().hex[:10]}", "name": req.name, "owner_user_id": user["user_id"],
+           "scopes": [s for s in req.scopes if s in SCOPE_ORDER], "spending_limit_cc": req.spending_limit_cc,
+           "agent_token": token, "active": True,
+           "session_expires_at": (datetime.now(timezone.utc) + timedelta(hours=req.session_ttl_hours)).isoformat(),
+           "created_at": datetime.now(timezone.utc).isoformat()}
+    await db.agents.insert_one(doc)
+    await audit(user["user_id"], "agent_created", {"agent_id": doc["agent_id"], "scopes": doc["scopes"]})
+    doc.pop("_id", None)
+    return doc
+
+@api_router.get("/admin/agents")
+async def list_agents(user: dict = Depends(get_current_user)):
+    await require_admin(user)
+    return await db.agents.find({}, {"_id": 0}).sort("created_at", -1).to_list(100)
+
+@api_router.post("/admin/agents/{agent_id}/revoke")
+async def revoke_agent(agent_id: str, user: dict = Depends(get_current_user)):
+    await require_admin(user)
+    await db.agents.update_one({"agent_id": agent_id}, {"$set": {"active": False}})
+    await audit(user["user_id"], "agent_revoked", {"agent_id": agent_id})
+    return {"ok": True}
+
+@api_router.get("/admin/audit")
+async def get_audit(user: dict = Depends(get_current_user)):
+    await require_admin(user)
+    return await db.audit_logs.find({}, {"_id": 0}).sort("created_at", -1).to_list(200)
+
+# ---- Agent Factory discovery ----
+@api_router.get("/agent/skills")
+async def agent_skills(agent: dict = Depends(get_agent)):
+    out = []
+    for name, s in SKILLS.items():
+        out.append({"name": name, **s, "authorized": has_scopes(agent, s["scopes"])})
+    return {"agent": agent["name"], "granted_scopes": agent["scopes"], "skills": out}
+
+# ---- Intent flow: PREPARE -> (CONFIRM) -> EXECUTE ----
+@api_router.post("/agent/intent")
+async def create_intent(req: IntentCreate, agent: dict = Depends(get_agent)):
+    skill = SKILLS.get(req.skill)
+    if not skill:
+        await audit(agent["agent_id"], "intent_denied", {"reason": "unknown_skill", "skill": req.skill})
+        raise HTTPException(status_code=400, detail="Skill inconnue → refusée")
+    if not has_scopes(agent, skill["scopes"]):
+        await audit(agent["agent_id"], "intent_denied", {"reason": "missing_scope", "skill": req.skill})
+        raise HTTPException(status_code=403, detail=f"Permissions insuffisantes (requis: {skill['scopes']})")
+    owner = await db.users.find_one({"user_id": agent["owner_user_id"]}, {"_id": 0})
+    preview = {"skill": req.skill, "capability": skill["capability"], "risk": skill["risk"]}
+    # Build preview + risk checks for fund-moving skills
+    if skill["capability"] == "send_asset":
+        amount = float(req.params.get("amount_cc", 0))
+        to = req.params.get("to", "")
+        if amount <= 0 or not to:
+            raise HTTPException(status_code=400, detail="Paramètres invalides (to, amount_cc)")
+        if amount > agent.get("spending_limit_cc", 0):
+            await audit(agent["agent_id"], "intent_denied", {"reason": "spending_limit", "amount": amount})
+            raise HTTPException(status_code=403, detail=f"Plafond dépassé (limite {agent.get('spending_limit_cc',0)} CC)")
+        if amount > owner.get("balance_cc", 0):
+            raise HTTPException(status_code=400, detail="Solde insuffisant")
+        preview.update({"from": owner.get("frek_id"), "to": to, "amount_cc": amount})
+    status = "awaiting_confirmation" if skill["confirm"] else "prepared"
+    doc = {"intent_id": f"int_{uuid.uuid4().hex[:10]}", "agent_id": agent["agent_id"], "owner_user_id": agent["owner_user_id"],
+           "skill": req.skill, "params": req.params, "risk": skill["risk"], "confirm_required": skill["confirm"],
+           "confirmed": False, "status": status, "preview": preview, "created_at": datetime.now(timezone.utc).isoformat()}
+    await db.agent_intents.insert_one(doc)
+    await audit(agent["agent_id"], "intent_prepared", {"intent_id": doc["intent_id"], "skill": req.skill, "status": status})
+    doc.pop("_id", None)
+    return doc
+
+@api_router.post("/agent/intent/{intent_id}/confirm")
+async def confirm_intent(intent_id: str, user: dict = Depends(get_current_user)):
+    intent = await db.agent_intents.find_one({"intent_id": intent_id}, {"_id": 0})
+    if not intent:
+        raise HTTPException(status_code=404, detail="Intent introuvable")
+    if intent["owner_user_id"] != user["user_id"]:
+        raise HTTPException(status_code=403, detail="Confirmation réservée au propriétaire du wallet")
+    await db.agent_intents.update_one({"intent_id": intent_id}, {"$set": {"confirmed": True, "status": "confirmed"}})
+    await audit(user["user_id"], "intent_confirmed", {"intent_id": intent_id})
+    return {"ok": True}
+
+@api_router.post("/agent/intent/{intent_id}/execute")
+async def execute_intent(intent_id: str, agent: dict = Depends(get_agent)):
+    intent = await db.agent_intents.find_one({"intent_id": intent_id}, {"_id": 0})
+    if not intent or intent["agent_id"] != agent["agent_id"]:
+        raise HTTPException(status_code=404, detail="Intent introuvable")
+    if intent["status"] == "executed":
+        raise HTTPException(status_code=400, detail="Déjà exécuté")
+    if intent["confirm_required"] and not intent.get("confirmed"):
+        await audit(agent["agent_id"], "execute_denied", {"intent_id": intent_id, "reason": "not_confirmed"})
+        raise HTTPException(status_code=403, detail="Confirmation utilisateur requise avant exécution")
+    skill = SKILLS[intent["skill"]]
+    if not has_scopes(agent, ["execute"]) and skill["capability"] == "send_asset":
+        raise HTTPException(status_code=403, detail="Scope 'execute' requis")
+    result = {"executed": True}
+    if skill["capability"] == "send_asset":
+        p = intent["preview"]
+        owner = await db.users.find_one({"user_id": intent["owner_user_id"]}, {"_id": 0})
+        if p["amount_cc"] > owner.get("balance_cc", 0):
+            raise HTTPException(status_code=400, detail="Solde insuffisant")
+        await add_transaction(intent["owner_user_id"], f"Agent {agent['name']} → {p['to']}", -p["amount_cc"], "Agent")
+        recipient = await db.users.find_one({"frek_id": p["to"]}, {"_id": 0})
+        if recipient:
+            await add_transaction(recipient["user_id"], f"Reçu via agent {agent['name']}", p["amount_cc"], "Agent")
+        result["amount_cc"] = p["amount_cc"]
+    await db.agent_intents.update_one({"intent_id": intent_id}, {"$set": {"status": "executed"}})
+    await audit(agent["agent_id"], "intent_executed", {"intent_id": intent_id, "result": result})
+    return {"ok": True, "result": result}
 
 
 app.include_router(api_router)
