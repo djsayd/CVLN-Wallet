@@ -27,7 +27,8 @@ ADMIN_EMAIL = os.environ.get("ADMIN_EMAIL", "")
 async def get_settings():
     s = await db.settings.find_one({"key": "app"}, {"_id": 0})
     if not s:
-        s = {"key": "app", "rate_eur": 1.5, "min_deposit_eur": 20.0, "reserve_cc": 0.0, "total_deposited_eur": 0.0}
+        s = {"key": "app", "rate_eur": 1.5, "min_deposit_eur": 20.0, "reserve_cc": 0.0, "total_deposited_eur": 0.0,
+             "ks_withdrawals": False, "ks_card": False, "ks_agents": False}
         await db.settings.insert_one(dict(s))
     return s
 
@@ -211,6 +212,11 @@ async def idem_fail(idem_id):
     # A request that never completed (validation error / crash) must NOT poison the key.
     if idem_id:
         await db.idempotency_records.delete_one({"idem_id": idem_id, "state": "PROCESSING"})
+
+async def assert_not_suspended(name: str):
+    st = await get_settings()
+    if st.get(f"ks_{name}"):
+        raise HTTPException(status_code=503, detail=f"OPERATION_SUSPENDED:{name}")
 
 async def get_or_seed_card(user_id: str) -> dict:
     c = await db.cards.find_one({"user_id": user_id}, {"_id": 0})
@@ -398,22 +404,29 @@ async def create_coffre(req: CoffreCreate, user: dict = Depends(get_current_user
 
 
 @api_router.post("/coffres/{coffre_id}/move")
-async def move_coffre(coffre_id: str, req: CoffreMove, user: dict = Depends(get_current_user)):
-    coffre = await db.coffres.find_one({"coffre_id": coffre_id, "user_id": user["user_id"]}, {"_id": 0})
-    if not coffre:
-        raise HTTPException(status_code=404, detail="Coffre introuvable")
-    if req.amount > 0 and req.amount > user.get("balance_cc", 0):
-        raise HTTPException(status_code=400, detail="Solde insuffisant")
-    if req.amount < 0 and -req.amount > coffre.get("amount_cc", 0):
-        raise HTTPException(status_code=400, detail="Fonds insuffisants dans le coffre")
-    await db.coffres.update_one({"coffre_id": coffre_id}, {"$inc": {"amount_cc": req.amount}})
-    await db.users.update_one({"user_id": user["user_id"]}, {"$inc": {"balance_cc": -req.amount}})
-    verb = "Dépôt vers" if req.amount > 0 else "Retrait de"
-    await ledger_post(f"{verb} {coffre['name']}", "Coffre",
-                      [(cash_acct(user["user_id"]), -req.amount), (coffre_acct(coffre_id), req.amount)])
-    await add_transaction(user["user_id"], f"{verb} {coffre['name']}", 0, "Coffre")
-    updated = await db.coffres.find_one({"coffre_id": coffre_id}, {"_id": 0})
-    return {"ok": True, "coffre": updated}
+async def move_coffre(coffre_id: str, req: CoffreMove, request: Request, user: dict = Depends(get_current_user)):
+    idem_id, cached = await idem_begin(request, user, "coffre_move", {"coffre_id": coffre_id, **req.dict()})
+    if cached is not None:
+        return cached
+    try:
+        coffre = await db.coffres.find_one({"coffre_id": coffre_id, "user_id": user["user_id"]}, {"_id": 0})
+        if not coffre:
+            raise HTTPException(status_code=404, detail="Coffre introuvable")
+        if req.amount > 0 and req.amount > user.get("balance_cc", 0):
+            raise HTTPException(status_code=400, detail="Solde insuffisant")
+        if req.amount < 0 and -req.amount > coffre.get("amount_cc", 0):
+            raise HTTPException(status_code=400, detail="Fonds insuffisants dans le coffre")
+        await db.coffres.update_one({"coffre_id": coffre_id}, {"$inc": {"amount_cc": req.amount}})
+        await db.users.update_one({"user_id": user["user_id"]}, {"$inc": {"balance_cc": -req.amount}})
+        verb = "Dépôt vers" if req.amount > 0 else "Retrait de"
+        await ledger_post(f"{verb} {coffre['name']}", "Coffre",
+                          [(cash_acct(user["user_id"]), -req.amount), (coffre_acct(coffre_id), req.amount)])
+        await add_transaction(user["user_id"], f"{verb} {coffre['name']}", 0, "Coffre")
+        updated = await db.coffres.find_one({"coffre_id": coffre_id}, {"_id": 0})
+        return await idem_finish(idem_id, {"ok": True, "coffre": updated})
+    except Exception:
+        await idem_fail(idem_id)
+        raise
 
 
 @api_router.delete("/coffres/{coffre_id}")
@@ -447,14 +460,21 @@ async def get_marketplace(user: dict = Depends(get_current_user)):
 
 
 @api_router.post("/marketplace/buy")
-async def buy_marketplace(req: MarketplaceBuy, user: dict = Depends(get_current_user)):
-    item = next((i for i in MARKETPLACE_ITEMS if i["item_id"] == req.item_id), None)
-    if not item:
-        raise HTTPException(status_code=404, detail="Article introuvable")
-    if item["price_cc"] > user.get("balance_cc", 0):
-        raise HTTPException(status_code=400, detail="Solde insuffisant")
-    tx = await add_transaction(user["user_id"], f"Achat — {item['title']}", -item["price_cc"], "Marketplace")
-    return {"ok": True, "transaction": tx}
+async def buy_marketplace(req: MarketplaceBuy, request: Request, user: dict = Depends(get_current_user)):
+    idem_id, cached = await idem_begin(request, user, "marketplace", req.dict())
+    if cached is not None:
+        return cached
+    try:
+        item = next((i for i in MARKETPLACE_ITEMS if i["item_id"] == req.item_id), None)
+        if not item:
+            raise HTTPException(status_code=404, detail="Article introuvable")
+        if item["price_cc"] > user.get("balance_cc", 0):
+            raise HTTPException(status_code=400, detail="Solde insuffisant")
+        tx = await add_transaction(user["user_id"], f"Achat — {item['title']}", -item["price_cc"], "Marketplace")
+        return await idem_finish(idem_id, {"ok": True, "transaction": tx})
+    except Exception:
+        await idem_fail(idem_id)
+        raise
 
 
 # ---------------- Ecosysteme ----------------
@@ -685,6 +705,7 @@ async def stripe_webhook(request: Request):
 # ---- Withdrawals (payout requests, real bank via Stripe Connect at go-live) ----
 @api_router.post("/withdrawals")
 async def create_withdrawal(req: WithdrawRequest, request: Request, user: dict = Depends(get_current_user)):
+    await assert_not_suspended("withdrawals")
     idem_id, cached = await idem_begin(request, user, "withdrawal", req.dict())
     if cached is not None:
         return cached
@@ -899,6 +920,7 @@ async def create_intent(req: IntentCreate, agent: dict = Depends(get_agent)):
             raise HTTPException(status_code=400, detail="Solde insuffisant")
         preview.update({"from": owner.get("frek_id"), "to": to, "amount_cc": amount})
     elif skill["capability"] == "card_pay":
+        await assert_not_suspended("card")
         card = await db.cards.find_one({"user_id": agent["owner_user_id"]}, {"_id": 0})
         amount = float(req.params.get("amount_cc", 0)); merchant = req.params.get("merchant", "Marchand")
         ptype = req.params.get("payment_type", "online")
@@ -942,6 +964,7 @@ async def confirm_intent(intent_id: str, user: dict = Depends(get_current_user))
 
 @api_router.post("/agent/intent/{intent_id}/execute")
 async def execute_intent(intent_id: str, agent: dict = Depends(get_agent)):
+    await assert_not_suspended("agents")
     intent = await db.agent_intents.find_one({"intent_id": intent_id}, {"_id": 0})
     if not intent or intent["agent_id"] != agent["agent_id"]:
         raise HTTPException(status_code=404, detail="Intent introuvable")
@@ -955,6 +978,7 @@ async def execute_intent(intent_id: str, agent: dict = Depends(get_agent)):
         raise HTTPException(status_code=403, detail="Scope 'execute' requis")
     result = {"executed": True}
     if skill["capability"] == "card_pay":
+        await assert_not_suspended("card")
         p = intent["preview"]
         card = await db.cards.find_one({"user_id": intent["owner_user_id"]}, {"_id": 0})
         owner = await db.users.find_one({"user_id": intent["owner_user_id"]}, {"_id": 0})
@@ -1106,6 +1130,16 @@ async def financial_health(user: dict = Depends(get_current_user)):
         "severity": "CRITICAL" if not (balanced and supply_ok) else "INFO",
     }
 
+@api_router.put("/admin/kill-switch")
+async def set_kill_switch(req: dict, user: dict = Depends(get_current_user)):
+    await require_admin(user)
+    name = req.get("name"); enabled = bool(req.get("enabled"))
+    if name not in ("withdrawals", "card", "agents"):
+        raise HTTPException(status_code=400, detail="Kill-switch inconnu")
+    await db.settings.update_one({"key": "app"}, {"$set": {f"ks_{name}": enabled}}, upsert=True)
+    await audit(user["user_id"], "KillSwitch.Toggled", {"name": name, "enabled": enabled})
+    return {"ok": True, "name": name, "enabled": enabled}
+
 @api_router.post("/admin/ledger/backfill")
 async def ledger_backfill(user: dict = Depends(get_current_user)):
     """Migration: aligns the ledger to legacy cached balances via labeled opening entries
@@ -1118,16 +1152,14 @@ async def ledger_backfill(user: dict = Depends(get_current_user)):
         diff = round(u.get("balance_cc", 0) - await ledger_balance(acc), 2)
         if abs(diff) > 0.005:
             await ledger_post("Solde d'ouverture (migration)", "Migration",
-                              [(acc, diff), (SYSTEM_ACCOUNTS["issuance"], -diff)],
-                              idempotency_key=f"backfill:{acc}")
+                              [(acc, diff), (SYSTEM_ACCOUNTS["issuance"], -diff)])
             fixed += 1
     async for c in db.coffres.find({}, {"coffre_id": 1, "amount_cc": 1}):
         acc = coffre_acct(c["coffre_id"])
         diff = round(c.get("amount_cc", 0) - await ledger_balance(acc), 2)
         if abs(diff) > 0.005:
             await ledger_post("Solde d'ouverture coffre (migration)", "Migration",
-                              [(acc, diff), (SYSTEM_ACCOUNTS["issuance"], -diff)],
-                              idempotency_key=f"backfill:{acc}")
+                              [(acc, diff), (SYSTEM_ACCOUNTS["issuance"], -diff)])
             fixed += 1
     return {"ok": True, "accounts_backfilled": fixed}
 

@@ -1,0 +1,59 @@
+{
+  "summary": "Backend-only verification of the P0.1-B increment (Idempotency-Key extended to marketplace buy + coffre move, and production kill-switches). New suite /app/backend/tests/test_p01b_idem_killswitch.py = 16 tests, 15 pass, 1 real gap found. VERIFIED: POST /api/marketplace/buy with the same Idempotency-Key + same body debits exactly once (GET /api/wallet before/after: -150 then unchanged, replay returns the SAME tx_id); same key + different item_id -> 409 IDEMPOTENCY_CONFLICT with no debit; without the header two identical buys both apply (no accidental dedupe, -240). POST /api/coffres/{id}/move with the same key applies once (coffre amount_cc 0->100 and stays 100 on replay, wallet -100 once, persistence confirmed via GET /api/coffres); same key + different amount -> 409 IDEMPOTENCY_CONFLICT. KILL-SWITCHES: PUT /api/admin/kill-switch {withdrawals:true} -> POST /api/withdrawals returns 503 detail 'OPERATION_SUSPENDED:withdrawals' with NO debit; after {enabled:false} withdrawal succeeds (200, wd amount 10, wallet -10). {agents:true} -> POST /api/agent/intent/{id}/execute with X-Agent-Token returns 503 OPERATION_SUSPENDED and no funds move; after disabling, the same confirmed Card.Pay intent executes (200, 50 CC debited). {card:true} correctly blocks Card.Pay intent CREATION (503). Invalid switch name -> 400; non-admin -> 403 (and the switch does not take effect); unauthenticated -> 401. REGRESSION: /api/admin/financial-health ledger_balanced=true and idempotency_in_progress=0, /api/admin/ledger/integrity balanced=true, POST /api/admin/ledger/backfill 200 with ledger still balanced afterwards. Pre-existing suite: backend_test.py 19/19 pass when run alone. All kill-switches reset to false and all TEST_ data (users, sessions, coffres, agents, intents, cards, withdrawals, idempotency records, ledger entries) removed - verified in Mongo.",
+  "backend_issues": {
+    "critical": [],
+    "minor": [
+      {
+        "endpoint": "POST /api/agent/intent/{id}/execute",
+        "issue": "The 'card' kill-switch is only enforced in create_intent (card_pay branch). An intent prepared/confirmed BEFORE the switch is flipped still EXECUTES while card ops are suspended: with ks_card=true the execute returned 200 and debited 25 CC (owner balance 950 -> 925). Add `await assert_not_suspended('card')` in the card_pay branch of execute_intent (reproduced deterministically by TestKillSwitch::test_card_killswitch_should_also_block_execute).",
+        "priority": "HIGH"
+      },
+      {
+        "endpoint": "POST /api/admin/ledger/backfill",
+        "issue": "STILL OPEN from iteration_2: static idempotency_key f'backfill:{acct}' means a second drift on an already-backfilled account is never corrected while the response still reports accounts_backfilled=1 (test_backfill_drift.py::test_backfill_cannot_fix_a_second_drift_on_same_account still fails)."
+      },
+      {
+        "endpoint": "POST /api/coffres/{id}/move",
+        "issue": "Only the API-level idempotency guard protects this route; the underlying ledger_post() is called WITHOUT idempotency_key (unlike add_transaction paths), so there is no defense-in-depth if idem_begin is bypassed/crashes mid-write. Also add_transaction(..., amount=0, 'Coffre') writes a zero-amount transaction row purely as a feed marker."
+      },
+      {
+        "endpoint": "POST /api/v1/entity/transfer, POST /api/v1/entity/charge, POST /api/payments/checkout",
+        "issue": "Remaining value mutations still have NO Idempotency-Key support and NO kill-switch (developer/entity API can move CC while 'withdrawals'/'card' are suspended). Consider a 'transfers'/'deposits' switch + idem_begin for parity."
+      },
+      {
+        "endpoint": "kill-switch semantics (harness note)",
+        "issue": "Kill-switches are a single global settings doc, so toggling them affects every user; with pytest.ini's forced -n 2 --dist loadscope, running the whole tests/ dir intermittently makes backend_test.py withdrawal tests see a spurious 503 (observed once) and makes the global supply-delta test drift (observed twice). Not a product defect but the kill-switch file should be run on its own for a clean signal (documented in the file docstring)."
+      },
+      {
+        "endpoint": "get_or_seed_card()",
+        "issue": "Duplicated `await db.cards.find_one(...)` line (server.py 222-223) - dead extra round-trip."
+      }
+    ]
+  },
+  "frontend_issues": {"ui_bugs": [], "integration_issues": [], "design_issues": []},
+  "test_report_links": [
+    "/app/backend/tests/test_p01b_idem_killswitch.py",
+    "/app/backend/tests/backend_test.py",
+    "/app/backend/tests/test_backfill_drift.py",
+    "/app/test_reports/pytest/pytest_p01b.xml",
+    "/app/test_reports/pytest/pytest_results.xml"
+  ],
+  "action_items": [
+    "Add `await assert_not_suspended('card')` (and ideally re-check limits) in the card_pay branch of execute_intent so a pre-existing intent cannot be executed while the card kill-switch is ON.",
+    "Fix the backfill static idempotency key (iteration_2 issue, still reproducible) and only increment accounts_backfilled when an entry was actually inserted.",
+    "Optional hardening: pass idempotency_key to ledger_post in move_coffre; extend idempotency/kill-switch coverage to /api/v1/entity/transfer|charge and checkout."
+  ],
+  "critical_code_review_comments": [
+    "Kill-switch coverage is asymmetric: 'withdrawals' and 'agents' are checked on the mutating endpoint, but 'card' is only checked at intent PREPARE time, leaving an execute-path bypass that moves real CC.",
+    "server.py is 1240 lines and mixes ledger, agents, card, admin and payments concerns - split into routers/modules before the next increment.",
+    "PUT /api/admin/kill-switch takes a raw `dict` body instead of a Pydantic model; use a model with a Literal['withdrawals','card','agents'] name so validation/OpenAPI are explicit (currently a bad name yields a generic 400 'Kill-switch inconnu' with no field-level error)."
+  ],
+  "updated_files": ["/app/backend/tests/test_p01b_idem_killswitch.py"],
+  "success_rate": {"backend": "94% (15/16 new P0.1-B tests; 19/19 pre-existing backend_test.py; 1/2 backfill_drift still failing from iteration_2)", "frontend": "not tested (backend-only request)"},
+  "seed_data_creation": "Ephemeral TEST_ users/sessions via conftest _mk_user (admin 1000 CC, plain 500 CC), one TEST_agent_ks agent with read/request/sign/execute + 500 CC limit, TEST_ coffres and Card.Pay intents. All deleted in fixture teardown; kill-switches reset to ks_withdrawals/ks_card/ks_agents=false (verified in Mongo).",
+  "should_call_test_agent_after_fix": true,
+  "should_main_agent_self_test": false,
+  "test_credentials": "Emergent Google auth; tests seed user+session directly in Mongo per /app/memory/test_credentials.md (Authorization: Bearer <session_token>).",
+  "context_for_next_testing_agent": "Reuse /app/backend/tests/conftest.py helpers (_mk_user, _cleanup, auth, wallet_balance, BASE_URL). New file test_p01b_idem_killswitch.py covers marketplace/coffre idempotency + all three kill-switches in ONE class (TestKillSwitch) on purpose, because kill-switches are global state and pytest.ini forces -n 2 --dist loadscope; run that file alone to avoid cross-worker 503 flakes with backend_test.py withdrawal tests. Two known failures remain: (1) card kill-switch not enforced on agent intent execute (deterministic), (2) backfill static idempotency key (iteration_2). Always verify db.settings ks_* are back to false after a run.",
+  "rca_of_the_issue": "assert_not_suspended('card') is placed in create_intent's card_pay preview branch only; execute_intent guards just assert_not_suspended('agents'). Since intents are durable documents, disabling the card switch after preparation does not stop the money movement in execute_intent -> add_transaction, so the kill-switch cannot stop in-flight card payments. Repro: create+confirm a Card.Pay intent, PUT /api/admin/kill-switch {name:'card',enabled:true}, POST /api/agent/intent/{id}/execute -> 200 and balance debited."
+}
