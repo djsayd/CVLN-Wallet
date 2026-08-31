@@ -42,3 +42,10 @@ Premium fintech wallet (Revolut/Qonto style) for CVLN Group cultural ecosystem. 
 - Mobile Wallet Apple/Google = PLANNED (eligibility + provision 501, aucune fausse activation).
 - Docs: CVLN-VIRTUAL-CARD-AUDIT/SKILLS/SECURITY.md + CVLN-MOBILE-WALLET.md.
 - Tests curl 10/10 OK: seed, eligibility PLANNED, provision 501, plafond carte, confirm+capture 150, freeze bloque, solde 1000->850.
+
+## Update 2026-06 — Financial Core Double-Entry Ledger (P0)
+- RULE: aucun module ne gere ses balances; tout passe par ledger_post(). Card/Coffres/Stripe/Retraits/Transferts/Marketplace/Agent routes via le Core.
+- ledger_entries equilibrees (Somme postings=0/asset), balances DERIVEES; users.balance_cc & coffres.amount_cc = caches verifies.
+- Comptes systeme: issuance/stripe/external/clearing/fx/revenue. Idempotency via idempotency_key.
+- Endpoints: GET /ledger/accounts, /ledger/entries, /admin/ledger/integrity. Page admin /ledger (Grand Livre).
+- Doc docs/CVLN-FINANCIAL-CORE.md. Test: balanced=True, per_asset JCC=0, 0 divergence cache/derive.

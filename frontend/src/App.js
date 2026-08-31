@@ -17,6 +17,7 @@ import FrekId from "@/pages/FrekId";
 import Card from "@/pages/Card";
 import Developers from "@/pages/Developers";
 import Admin from "@/pages/Admin";
+import Ledger from "@/pages/Ledger";
 import Agents from "@/pages/Agents";
 import PaymentSuccess from "@/pages/PaymentSuccess";
 import Parametres from "@/pages/Parametres";
@@ -90,6 +91,7 @@ function AppRouter() {
         <Route path="/frek-id" element={<FrekId />} />
         <Route path="/developers" element={<Developers />} />
         <Route path="/admin" element={<Admin />} />
+        <Route path="/ledger" element={<Ledger />} />
         <Route path="/agents" element={<Agents />} />
         <Route path="/payment/success" element={<PaymentSuccess />} />
         <Route path="/parametres" element={<Parametres />} />
@@ -109,6 +111,7 @@ export default function App() {
     </BrowserRouter>
   );
 }
+
 
 
 

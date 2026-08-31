@@ -123,6 +123,60 @@ async def seed_user_data(user_id: str):
         await db.coffres.insert_many(coffres)
 
 
+# ================= FINANCIAL CORE — DOUBLE-ENTRY LEDGER =================
+# RULE: No module manages its own balances. Card, Invest, Crypto, FX, Rewards, JCC and
+# all future accounts MUST route every value movement through ledger_post(). Every entry
+# is balanced (sum of signed postings == 0 per asset). Balances are DERIVED from the ledger;
+# users.balance_cc / coffres.amount_cc are denormalized caches verified by the integrity check.
+SYSTEM_ACCOUNTS = {
+    "issuance": "acct_sys_issuance",   # minting against rewards
+    "stripe": "acct_sys_stripe",       # fiat-in clearing (Stripe)
+    "external": "acct_sys_external",    # payouts / withdrawals
+    "clearing": "acct_sys_clearing",    # internal transfers netting
+    "fx": "acct_sys_fx",                # conversions
+    "revenue": "acct_sys_revenue",      # merchant / marketplace / card capture
+}
+DEFAULT_ASSET = "JCC"
+
+def cash_acct(user_id: str) -> str:
+    return f"acct_cash_{user_id}"
+
+def coffre_acct(coffre_id: str) -> str:
+    return f"acct_coffre_{coffre_id}"
+
+def _counter_account(category: str) -> str:
+    mapping = {"Dépôt": "stripe", "Retrait": "external", "Conversion": "fx",
+               "Reward": "issuance", "Marketplace": "revenue", "Card": "revenue"}
+    return SYSTEM_ACCOUNTS.get(mapping.get(category, "clearing"))
+
+async def ledger_post(description, category, postings, asset=DEFAULT_ASSET, ref=None, idempotency_key=None):
+    """postings: list of (account_id, signed_amount). Must sum to 0 for the asset."""
+    if idempotency_key:
+        existing = await db.ledger_entries.find_one({"idempotency_key": idempotency_key}, {"_id": 0})
+        if existing:
+            return existing["entry_id"]
+    total = round(sum(p[1] for p in postings), 6)
+    if abs(total) > 1e-6:
+        raise HTTPException(status_code=500, detail=f"Écriture déséquilibrée (Δ={total})")
+    entry_id = f"le_{uuid.uuid4().hex[:12]}"
+    await db.ledger_entries.insert_one({
+        "entry_id": entry_id, "idempotency_key": idempotency_key or entry_id,
+        "description": description, "category": category, "asset": asset, "ref": ref,
+        "postings": [{"account_id": a, "amount": round(amt, 2)} for a, amt in postings],
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    })
+    return entry_id
+
+async def ledger_balance(account_id: str) -> float:
+    cur = db.ledger_entries.aggregate([
+        {"$unwind": "$postings"},
+        {"$match": {"postings.account_id": account_id}},
+        {"$group": {"_id": None, "bal": {"$sum": "$postings.amount"}}},
+    ])
+    async for r in cur:
+        return round(r["bal"], 2)
+    return 0.0
+
 async def get_or_seed_card(user_id: str) -> dict:
     c = await db.cards.find_one({"user_id": user_id}, {"_id": 0})
     if not c:
@@ -142,7 +196,7 @@ async def _today_card_spent(user_id: str) -> float:
             spent += -t["amount"]
     return spent
 
-async def add_transaction(user_id: str, label: str, amount: float, category: str):
+async def add_transaction(user_id: str, label: str, amount: float, category: str, idempotency_key: str = None):
     doc = {
         "tx_id": f"tx_{uuid.uuid4().hex[:10]}",
         "user_id": user_id,
@@ -154,6 +208,10 @@ async def add_transaction(user_id: str, label: str, amount: float, category: str
     }
     await db.transactions.insert_one(doc)
     if amount != 0:
+        # Financial Core: every balance movement is a balanced ledger entry.
+        await ledger_post(label, category,
+                          [(cash_acct(user_id), amount), (_counter_account(category), -amount)],
+                          ref=doc["tx_id"], idempotency_key=idempotency_key)
         await db.users.update_one({"user_id": user_id}, {"$inc": {"balance_cc": amount}})
     doc.pop("_id", None)
     return doc
@@ -306,6 +364,8 @@ async def move_coffre(coffre_id: str, req: CoffreMove, user: dict = Depends(get_
     await db.coffres.update_one({"coffre_id": coffre_id}, {"$inc": {"amount_cc": req.amount}})
     await db.users.update_one({"user_id": user["user_id"]}, {"$inc": {"balance_cc": -req.amount}})
     verb = "Dépôt vers" if req.amount > 0 else "Retrait de"
+    await ledger_post(f"{verb} {coffre['name']}", "Coffre",
+                      [(cash_acct(user["user_id"]), -req.amount), (coffre_acct(coffre_id), req.amount)])
     await add_transaction(user["user_id"], f"{verb} {coffre['name']}", 0, "Coffre")
     updated = await db.coffres.find_one({"coffre_id": coffre_id}, {"_id": 0})
     return {"ok": True, "coffre": updated}
@@ -318,6 +378,8 @@ async def delete_coffre(coffre_id: str, user: dict = Depends(get_current_user)):
         raise HTTPException(status_code=404, detail="Coffre introuvable")
     if coffre.get("amount_cc", 0) > 0:
         await db.users.update_one({"user_id": user["user_id"]}, {"$inc": {"balance_cc": coffre["amount_cc"]}})
+        await ledger_post(f"Fermeture {coffre['name']}", "Coffre",
+                          [(coffre_acct(coffre_id), -coffre["amount_cc"]), (cash_acct(user["user_id"]), coffre["amount_cc"])])
     await db.coffres.delete_one({"coffre_id": coffre_id})
     return {"ok": True}
 
@@ -911,7 +973,48 @@ async def card_pay(user: dict = Depends(get_current_user)):
     # Human-initiated card payment (demo). Amount/merchant via body.
     raise HTTPException(status_code=400, detail="Utilisez la Marketplace ou un paiement agent (Card.Pay).")
 
-# ---- Mobile Wallet provisioning (Apple/Google) — PLANNED, no real issuer ----
+# ---- Financial Core read + integrity ----
+@api_router.get("/ledger/accounts")
+async def ledger_accounts(user: dict = Depends(get_current_user)):
+    out = []
+    cash_id = cash_acct(user["user_id"])
+    out.append({"account_id": cash_id, "name": "Compte principal", "type": "cash", "asset": DEFAULT_ASSET,
+                "balance": await ledger_balance(cash_id), "cached": user.get("balance_cc", 0)})
+    async for c in db.coffres.find({"user_id": user["user_id"]}, {"_id": 0}):
+        aid = coffre_acct(c["coffre_id"])
+        out.append({"account_id": aid, "name": c["name"], "type": "coffre", "asset": DEFAULT_ASSET,
+                    "balance": await ledger_balance(aid), "cached": c.get("amount_cc", 0)})
+    return out
+
+@api_router.get("/ledger/entries")
+async def ledger_entries(user: dict = Depends(get_current_user), limit: int = 100):
+    ids = [cash_acct(user["user_id"])]
+    async for c in db.coffres.find({"user_id": user["user_id"]}, {"coffre_id": 1}):
+        ids.append(coffre_acct(c["coffre_id"]))
+    return await db.ledger_entries.find({"postings.account_id": {"$in": ids}}, {"_id": 0}).sort("created_at", -1).to_list(limit)
+
+@api_router.get("/admin/ledger/integrity")
+async def ledger_integrity(user: dict = Depends(get_current_user)):
+    await require_admin(user)
+    # Global invariant: sum of ALL postings per asset must equal 0.
+    per_asset = {}
+    total_entries = 0
+    async for e in db.ledger_entries.find({}, {"_id": 0, "asset": 1, "postings": 1}):
+        total_entries += 1
+        per_asset.setdefault(e["asset"], 0.0)
+        per_asset[e["asset"]] += sum(p["amount"] for p in e["postings"])
+    per_asset = {k: round(v, 6) for k, v in per_asset.items()}
+    balanced = all(abs(v) < 1e-6 for v in per_asset.values())
+    # Cache vs derived for a sample of users
+    mism = []
+    async for u in db.users.find({}, {"user_id": 1, "balance_cc": 1}).limit(50):
+        derived = await ledger_balance(cash_acct(u["user_id"]))
+        if abs(derived - u.get("balance_cc", 0)) > 1e-6:
+            mism.append({"user_id": u["user_id"], "cached": u.get("balance_cc", 0), "derived": derived})
+    return {"balanced": balanced, "per_asset_sum": per_asset, "entries": total_entries,
+            "cache_mismatches": mism, "system_accounts": {k: await ledger_balance(v) for k, v in SYSTEM_ACCOUNTS.items()}}
+
+
 @api_router.get("/card/wallet-eligibility")
 async def wallet_eligibility(user: dict = Depends(get_current_user)):
     await audit(user["user_id"], "MobileWallet.EligibilityChecked", {})
