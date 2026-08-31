@@ -49,3 +49,10 @@ Premium fintech wallet (Revolut/Qonto style) for CVLN Group cultural ecosystem. 
 - Comptes systeme: issuance/stripe/external/clearing/fx/revenue. Idempotency via idempotency_key.
 - Endpoints: GET /ledger/accounts, /ledger/entries, /admin/ledger/integrity. Page admin /ledger (Grand Livre).
 - Doc docs/CVLN-FINANCIAL-CORE.md. Test: balanced=True, per_asset JCC=0, 0 divergence cache/derive.
+
+## Update 2026-06 — P0.1 Financial Core Hardening
+- Idempotency engine API (Idempotency-Key): idem_begin/idem_finish, collection idempotency_records (unique index). Applique a /actions/send et /withdrawals. Ledger idempotency_key unique.
+- Integrity etendu + GET /admin/financial-health (ledger_balanced, jcc_supply_reconciled, circulation, idempotency counts, severity).
+- system/status enrichi (idempotency_api REAL; holds/refund/reversal/fees/outbox/state_machines PLANNED; settlement PARTIAL).
+- Docs: CVLN-IDEMPOTENCY.md, CVLN-FINANCIAL-INVARIANTS.md.
+- Reste PLANNED (non maquille): state-machine engine, holds/available-balance, refund/reversal/fees engines, settlement externe, reconciliation cases, outbox, Decimal minor-units.

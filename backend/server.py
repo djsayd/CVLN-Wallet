@@ -177,7 +177,43 @@ async def ledger_balance(account_id: str) -> float:
         return round(r["bal"], 2)
     return 0.0
 
+# ---- Idempotency engine (API-level, reusable) ----
+async def idem_begin(request, user, scope, payload):
+    key = request.headers.get("Idempotency-Key")
+    if not key:
+        return None, None
+    import hashlib, json as _json
+    from pymongo.errors import DuplicateKeyError
+    idem_id = f"{scope}:{user['user_id']}:{key}"
+    h = hashlib.sha256(_json.dumps(payload, sort_keys=True, default=str).encode()).hexdigest()
+    try:
+        await db.idempotency_records.insert_one({
+            "idem_id": idem_id, "scope": scope, "user_id": user["user_id"], "hash": h,
+            "state": "PROCESSING", "response": None, "created_at": datetime.now(timezone.utc).isoformat()})
+        return idem_id, None
+    except DuplicateKeyError:
+        rec = await db.idempotency_records.find_one({"idem_id": idem_id}, {"_id": 0})
+        if not rec:
+            raise HTTPException(status_code=409, detail="IDEMPOTENCY_IN_PROGRESS")
+        if rec.get("hash") != h:
+            raise HTTPException(status_code=409, detail="IDEMPOTENCY_CONFLICT")
+        if rec.get("state") == "COMPLETED":
+            return idem_id, rec.get("response")
+        raise HTTPException(status_code=409, detail="IDEMPOTENCY_IN_PROGRESS")
+
+async def idem_finish(idem_id, response):
+    if idem_id:
+        await db.idempotency_records.update_one({"idem_id": idem_id},
+            {"$set": {"state": "COMPLETED", "response": response, "completed_at": datetime.now(timezone.utc).isoformat()}})
+    return response
+
+async def idem_fail(idem_id):
+    # A request that never completed (validation error / crash) must NOT poison the key.
+    if idem_id:
+        await db.idempotency_records.delete_one({"idem_id": idem_id, "state": "PROCESSING"})
+
 async def get_or_seed_card(user_id: str) -> dict:
+    c = await db.cards.find_one({"user_id": user_id}, {"_id": 0})
     c = await db.cards.find_one({"user_id": user_id}, {"_id": 0})
     if not c:
         c = {"card_id": f"card_{uuid.uuid4().hex[:10]}", "user_id": user_id, "brand": "CVLN Virtual",
@@ -311,14 +347,21 @@ async def get_transactions(user: dict = Depends(get_current_user), limit: int = 
 
 
 @api_router.post("/actions/send")
-async def send_money(req: SendRequest, user: dict = Depends(get_current_user)):
-    if req.amount <= 0:
-        raise HTTPException(status_code=400, detail="Montant invalide")
-    if req.amount > user.get("balance_cc", 0):
-        raise HTTPException(status_code=400, detail="Solde insuffisant")
-    label = f"Envoi à {req.recipient}" + (f" — {req.note}" if req.note else "")
-    tx = await add_transaction(user["user_id"], label, -req.amount, "Transfert")
-    return {"ok": True, "transaction": tx}
+async def send_money(req: SendRequest, request: Request, user: dict = Depends(get_current_user)):
+    idem_id, cached = await idem_begin(request, user, "send", req.dict())
+    if cached is not None:
+        return cached
+    try:
+        if req.amount <= 0:
+            raise HTTPException(status_code=400, detail="Montant invalide")
+        if req.amount > user.get("balance_cc", 0):
+            raise HTTPException(status_code=400, detail="Solde insuffisant")
+        label = f"Envoi à {req.recipient}" + (f" — {req.note}" if req.note else "")
+        tx = await add_transaction(user["user_id"], label, -req.amount, "Transfert")
+        return await idem_finish(idem_id, {"ok": True, "transaction": tx})
+    except Exception:
+        await idem_fail(idem_id)
+        raise
 
 
 @api_router.post("/actions/buy")
@@ -535,6 +578,11 @@ async def rotate_key(entity_id: str, user: dict = Depends(get_current_user)):
 
 @app.on_event("startup")
 async def seed_entities():
+    try:
+        await db.idempotency_records.create_index("idem_id", unique=True)
+        await db.ledger_entries.create_index("idempotency_key", unique=True)
+    except Exception:
+        pass
     count = await db.entities.count_documents({})
     if count > 0:
         return
@@ -636,20 +684,27 @@ async def stripe_webhook(request: Request):
 
 # ---- Withdrawals (payout requests, real bank via Stripe Connect at go-live) ----
 @api_router.post("/withdrawals")
-async def create_withdrawal(req: WithdrawRequest, user: dict = Depends(get_current_user)):
-    if req.amount_cc <= 0:
-        raise HTTPException(status_code=400, detail="Montant invalide")
-    if req.amount_cc > user.get("balance_cc", 0):
-        raise HTTPException(status_code=400, detail="Solde insuffisant")
-    st = await get_settings()
-    eur = round(req.amount_cc * st["rate_eur"], 2)
-    await add_transaction(user["user_id"], f"Retrait demandé — {req.amount_cc} CC", -req.amount_cc, "Retrait")
-    doc = {"wd_id": f"wd_{uuid.uuid4().hex[:10]}", "user_id": user["user_id"], "user_name": user.get("name"),
-           "frek_id": user.get("frek_id"), "amount_cc": req.amount_cc, "amount_eur": eur,
-           "iban": req.iban, "status": "pending", "created_at": datetime.now(timezone.utc).isoformat()}
-    await db.withdrawals.insert_one(doc)
-    doc.pop("_id", None)
-    return {"ok": True, "withdrawal": doc}
+async def create_withdrawal(req: WithdrawRequest, request: Request, user: dict = Depends(get_current_user)):
+    idem_id, cached = await idem_begin(request, user, "withdrawal", req.dict())
+    if cached is not None:
+        return cached
+    try:
+        if req.amount_cc <= 0:
+            raise HTTPException(status_code=400, detail="Montant invalide")
+        if req.amount_cc > user.get("balance_cc", 0):
+            raise HTTPException(status_code=400, detail="Solde insuffisant")
+        st = await get_settings()
+        eur = round(req.amount_cc * st["rate_eur"], 2)
+        await add_transaction(user["user_id"], f"Retrait demandé — {req.amount_cc} CC", -req.amount_cc, "Retrait")
+        doc = {"wd_id": f"wd_{uuid.uuid4().hex[:10]}", "user_id": user["user_id"], "user_name": user.get("name"),
+               "frek_id": user.get("frek_id"), "amount_cc": req.amount_cc, "amount_eur": eur,
+               "iban": req.iban, "status": "pending", "created_at": datetime.now(timezone.utc).isoformat()}
+        await db.withdrawals.insert_one(doc)
+        doc.pop("_id", None)
+        return await idem_finish(idem_id, {"ok": True, "withdrawal": doc})
+    except Exception:
+        await idem_fail(idem_id)
+        raise
 
 @api_router.get("/withdrawals")
 async def my_withdrawals(user: dict = Depends(get_current_user)):
@@ -1016,6 +1071,67 @@ async def ledger_integrity(user: dict = Depends(get_current_user)):
     return {"balanced": balanced, "per_asset_sum": per_asset, "entries": total_entries,
             "cache_mismatches": mism, "system_accounts": {k: await ledger_balance(v) for k, v in SYSTEM_ACCOUNTS.items()}}
 
+@api_router.get("/admin/financial-health")
+async def financial_health(user: dict = Depends(get_current_user)):
+    await require_admin(user)
+    per_asset = {}
+    total_entries = 0
+    async for e in db.ledger_entries.find({}, {"_id": 0, "asset": 1, "postings": 1}):
+        total_entries += 1
+        per_asset.setdefault(e["asset"], 0.0)
+        per_asset[e["asset"]] += sum(p["amount"] for p in e["postings"])
+    balanced = all(abs(round(v, 6)) < 1e-6 for v in per_asset.values())
+    # JCC in circulation = sum of user cash + coffre accounts (should equal -sum(system))
+    circ = 0.0
+    async for u in db.users.find({}, {"balance_cc": 1}):
+        circ += u.get("balance_cc", 0)
+    coffre_total = 0.0
+    async for c in db.coffres.find({}, {"amount_cc": 1}):
+        coffre_total += c.get("amount_cc", 0)
+    sys_total = 0.0
+    for v in SYSTEM_ACCOUNTS.values():
+        sys_total += await ledger_balance(v)
+    supply_ok = abs(round((circ + coffre_total) + sys_total, 6)) < 1e-6
+    idem_total = await db.idempotency_records.count_documents({})
+    idem_processing = await db.idempotency_records.count_documents({"state": "PROCESSING"})
+    return {
+        "ledger_balanced": balanced,
+        "per_asset_sum": {k: round(v, 6) for k, v in per_asset.items()},
+        "ledger_entries": total_entries,
+        "jcc_circulation": round(circ + coffre_total, 2),
+        "jcc_supply_reconciled": supply_ok,
+        "pending_withdrawals": await db.withdrawals.count_documents({"status": "pending"}),
+        "idempotency_records": idem_total,
+        "idempotency_in_progress": idem_processing,
+        "severity": "CRITICAL" if not (balanced and supply_ok) else "INFO",
+    }
+
+@api_router.post("/admin/ledger/backfill")
+async def ledger_backfill(user: dict = Depends(get_current_user)):
+    """Migration: aligns the ledger to legacy cached balances via labeled opening entries
+    (counterpart = issuance). Makes the ledger the source of truth for pre-ledger data.
+    Never destructive; only appends compensating entries where derived != cache."""
+    await require_admin(user)
+    fixed = 0
+    async for u in db.users.find({}, {"user_id": 1, "balance_cc": 1}):
+        acc = cash_acct(u["user_id"])
+        diff = round(u.get("balance_cc", 0) - await ledger_balance(acc), 2)
+        if abs(diff) > 0.005:
+            await ledger_post("Solde d'ouverture (migration)", "Migration",
+                              [(acc, diff), (SYSTEM_ACCOUNTS["issuance"], -diff)],
+                              idempotency_key=f"backfill:{acc}")
+            fixed += 1
+    async for c in db.coffres.find({}, {"coffre_id": 1, "amount_cc": 1}):
+        acc = coffre_acct(c["coffre_id"])
+        diff = round(c.get("amount_cc", 0) - await ledger_balance(acc), 2)
+        if abs(diff) > 0.005:
+            await ledger_post("Solde d'ouverture coffre (migration)", "Migration",
+                              [(acc, diff), (SYSTEM_ACCOUNTS["issuance"], -diff)],
+                              idempotency_key=f"backfill:{acc}")
+            fixed += 1
+    return {"ok": True, "accounts_backfilled": fixed}
+
+
 
 # ---- System status: BUILD vs ACTIVATION tracks (honest capability statuses) ----
 FEATURE_FLAGS = {
@@ -1037,6 +1153,10 @@ CAPABILITY_STATUS = {
     "invest": "PLANNED", "crypto": "PLANNED", "fx": "PLANNED",
     "business": "PLANNED", "rwa": "PLANNED", "open_banking": "PLANNED",
     "reconciliation": "PARTIAL", "reporting": "PARTIAL",
+    "idempotency_api": "REAL", "state_machines": "PLANNED", "holds": "PLANNED",
+    "refund_engine": "PLANNED", "reversal_engine": "PLANNED", "settlement_engine": "PARTIAL",
+    "fees_engine": "PLANNED", "outbox_events": "PLANNED", "account_registry": "PARTIAL",
+    "asset_registry": "PARTIAL",
 }
 
 @api_router.get("/system/status")

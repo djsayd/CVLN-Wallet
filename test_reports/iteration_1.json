@@ -1,0 +1,37 @@
+{
+  "summary": "Backend-only verification of CVLN Financial Core hardening (Mission P0.1). Created pytest suite (/app/backend/tests/) with 15 tests covering the API idempotency engine on POST /api/actions/send and POST /api/withdrawals (replay, conflict, per-user key scoping, failure retry), ledger double-entry integrity (/api/admin/ledger/integrity), /api/admin/financial-health, admin-only protection and non-regression of key-less send + coffre move. 12/15 passed. Idempotency replay protection works correctly (no double debit, same tx_id/wd_id returned, single ledger entry + single transaction persisted); 409 IDEMPOTENCY_CONFLICT returned for same key + different body on both endpoints; ledger is balanced (per_asset_sum JCC == 0) and cache_mismatches == [] ; admin endpoints return 403 for non-admin and 401 unauthenticated. Two real defects found: (1) an Idempotency-Key used on a request that fails validation is permanently poisoned (record stays PROCESSING -> every retry returns 409 IDEMPOTENCY_IN_PROGRESS); (2) jcc_supply_reconciled=false / severity=CRITICAL caused by legacy non-ledger data in the DB (orphan coffres worth 173,400 JCC + a stale 100 JCC entry for deleted user acct_cash_u_idem). Proved by a delta test that the discrepancy is NOT changed by ledger operations (delta = 0), i.e. the ledger code is consistent but legacy data was never backfilled.",
+  "backend_issues": {
+    "critical": [
+      {"endpoint": "POST /api/actions/send (and /api/withdrawals) with Idempotency-Key", "issue": "idem_begin() inserts the idempotency_records doc with state=PROCESSING BEFORE business validation. If the request then fails (e.g. 400 'Solde insuffisant') or the process crashes, the record is never finished/removed, so the same key+body can never be retried: it returns 409 IDEMPOTENCY_IN_PROGRESS forever (verified: 400 then 409). Fix: wrap the handler so failures mark the record FAILED/delete it, and add a TTL index on created_at to auto-expire stuck PROCESSING records.", "priority": "HIGH"},
+      {"endpoint": "GET /api/admin/financial-health", "issue": "jcc_supply_reconciled=false and severity=CRITICAL on the current dataset. Root cause is legacy data, not the ledger code: 4 orphan coffres of user_b02e5638bc1a (user no longer exists) hold 173,400 JCC in coffres.amount_cc with no ledger entries, plus a stale ledger entry crediting acct_sys_clearing +100 for the deleted test user acct_cash_u_idem. Fix: one-off migration to post legacy coffre/user balances into the ledger (issuance -> account) or purge orphan coffres/stale entries, otherwise the health endpoint permanently reports CRITICAL.", "priority": "HIGH"}
+    ],
+    "minor": [
+      {"endpoint": "GET /api/admin/ledger/integrity", "issue": "Cache-vs-derived check is limited to .limit(50) users and ignores coffres.amount_cc vs acct_coffre_* derived balances, so coffre cache drift (the exact source of the current supply mismatch) is invisible in cache_mismatches."},
+      {"endpoint": "POST /api/withdrawals", "issue": "No IBAN format validation (any string accepted) in WithdrawRequest."},
+      {"endpoint": "POST /api/coffres/{id}/move", "issue": "Updates coffres.amount_cc / users.balance_cc BEFORE ledger_post and creates a 0-amount transaction; no Idempotency-Key support, so a duplicated client call moves funds twice."}
+    ]
+  },
+  "frontend_issues": {"ui_bugs": [], "integration_issues": [], "design_issues": []},
+  "test_report_links": ["/app/backend/tests/backend_test.py", "/app/backend/tests/conftest.py", "/app/test_reports/pytest/pytest_results.xml"],
+  "action_items": [
+    "Release/expire idempotency records on failure (mark FAILED or delete) + TTL index, so failed requests are retryable with the same key",
+    "Backfill or purge legacy non-ledger balances (orphan coffres of user_b02e5638bc1a = 173,400 JCC, stale acct_cash_u_idem entry) so financial-health reports reconciled/INFO",
+    "Extend integrity check to coffre accounts and remove the 50-user limit (paginate)",
+    "Add Idempotency-Key support to /api/coffres/{id}/move (value movement without replay protection)"
+  ],
+  "critical_code_review_comments": [
+    "server.py send_money/create_withdrawal: idem_begin before validation creates poisoned keys; move record creation after validation or add failure cleanup in a try/except.",
+    "add_transaction() is called without idempotency_key from send/withdrawal, so replay safety depends solely on the API layer; pass a deterministic key (e.g. idem_id) into ledger_post for defence in depth.",
+    "server.py is 1169 lines - split into routers (auth, wallet, ledger, admin, agents, card).",
+    "get_or_seed_card(): duplicated db.cards.find_one call (lines 211-212), dead code.",
+    "ledger_integrity()/financial_health() duplicate the same per-asset aggregation loop in Python; extract a shared helper and use a Mongo aggregation instead of a per-entry Python loop (O(n) round-trip cost)."
+  ],
+  "updated_files": ["/app/backend/tests/backend_test.py", "/app/backend/tests/conftest.py"],
+  "success_rate": {"backend": "80% (12/15 tests)", "frontend": "not tested (backend-only request)"},
+  "seed_data_creation": "Seeded via pymongo: TEST_ta_admin_* (is_admin=true, 1000 JCC) and TEST_ta_user_* (500 JCC), each funded with a BALANCED ledger entry (issuance -> acct_cash_<uid>) plus user_sessions token. All test users, sessions, transactions, withdrawals, coffres, idempotency records and ledger entries were deleted at teardown (verified: 0 TEST_* docs remain, ledger back to 1 pre-existing entry).",
+  "should_call_test_agent_after_fix": true,
+  "should_main_agent_self_test": false,
+  "test_credentials": "/app/memory/test_credentials.md is an empty template (no credentials). Auth is Emergent Google; tests seed users+sessions directly in MongoDB (see conftest._mk_user).",
+  "context_for_next_testing_agent": "Run: cd /app/backend && python -m pytest tests/ -n 0 -v (use -n 0 to avoid xdist cross-class races on shared balances). conftest.py seeds users/sessions with ledger-consistent funding and cleans up. The 3 known failures are: test_failed_request_key_is_not_poisoned (idempotency poison bug), test_financial_health + test_supply_discrepancy_unchanged_by_ledger_ops (legacy 173,500 JCC non-ledger data). The 'unchanged by ledger ops' half of that test already passes (delta 0), so once legacy data is backfilled/purged both should go green. Frontend was intentionally not tested.",
+  "rca_of_the_issue": "1) Poisoned idempotency key: idem_begin() inserts state=PROCESSING before amount/balance validation in send_money and create_withdrawal, and idem_finish() only runs on success; HTTPException paths leave the record PROCESSING, and the unique idem_id index then makes every retry raise 409 IDEMPOTENCY_IN_PROGRESS. 2) Supply mismatch: financial_health computes circulation = sum(users.balance_cc) + sum(coffres.amount_cc) and compares with -sum(system accounts). The DB contains 4 coffres (173,400 JCC) belonging to a deleted user that were seeded directly into amount_cc without any ledger entry, plus one stale ledger entry (+100 to acct_sys_clearing) whose user cash account no longer maps to an existing user, so the comparison is off by 173,500 JCC regardless of new operations."
+}
