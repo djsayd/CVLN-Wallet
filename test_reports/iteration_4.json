@@ -1,0 +1,39 @@
+{
+  "summary": "Independent backend re-verification of P0.1-B2 (transaction state machine + holds/reservations + available balance + anti-double-spend). Wrote 3 new pytest suites (32 new tests) using TRUE parallel HTTP (ThreadPoolExecutor) against the public preview URL. Results: 68/69 tests pass. All anti-double-spend / atomicity / idempotency / partial-capture / release / lazy-expiry / illegal-transition invariants HOLD, including at the capture-vs-expiry race boundary and under a randomized chaos load. One real defect found: the holds integrity report (and therefore GET /api/admin/financial-health severity) turns CRITICAL/unhealthy for any expired-but-not-yet-read hold, i.e. lazy-expiry produces a monitoring FALSE POSITIVE. Also fixed one stale assertion in the pre-existing backfill test (server no longer uses the static 'backfill:<acct>' idempotency key).",
+  "backend_issues": {
+    "critical": [],
+    "minor": [
+      {"endpoint": "GET /api/admin/holds/integrity, GET /api/admin/financial-health", "issue": "FALSE POSITIVE with lazy-expiry: holds_integrity_report() does not reconcile expired holds before comparing. A hold whose TTL lapsed and whose owner has not been read since is reported in held_mismatch (cache 40 vs effective 0) AND expired_still_active -> healthy=false -> financial-health severity=CRITICAL, even though funds are effectively free and self-heal on the next read. Since there is no expiry worker, this will fire routinely in production. Repro test: tests/test_p01b2_holds_race.py::TestLazyExpiryIntegrityFalsePositive (currently failing by design to document the bug). Fix: run reconcile_expired_holds (or treat expiry-pending remaining as effective 0 and not as a mismatch) inside the report, or downgrade 'expired_still_active' to an INFO/maintenance signal instead of a health breach."},
+      {"endpoint": "GET /api/system/status", "issue": "Requires authentication (401 anonymous). Not a bug, but note for the review request which assumed it was public. Capability values verified honest once authenticated."}
+    ]
+  },
+  "frontend_issues": {"ui_bugs": [], "integration_issues": [], "design_issues": []},
+  "test_report_links": [
+    "/app/backend/tests/test_p01b2_holds.py",
+    "/app/backend/tests/test_p01b2_holds_race.py",
+    "/app/backend/tests/test_p01b2_holds_burst.py",
+    "/app/test_reports/pytest/pytest_results.xml"
+  ],
+  "action_items": [
+    "Make holds integrity / financial-health lazy-expiry aware so an untouched expired hold does not report severity=CRITICAL (only real defect found)."
+  ],
+  "critical_code_review_comments": [
+    "server.py is 1482 lines and mixes ledger, holds, cards, admin, agents — split into routers/modules (>700 line rule).",
+    "capture_hold does the atomic $inc captured first, then a separate $set status and $inc held_cc: a crash in that window leaves status ACTIVE with captured incremented (funds stay locked = under-release, never over-spend). Acceptable per documented compensation strategy, but the rebuild endpoint is currently the only repair path — consider an outbox/worker so repair is not admin-manual.",
+    "get_or_seed_card has a duplicated find_one call (server.py ~L223-224) — dead line.",
+    "No expiry worker exists; lazy-expiry only triggers on user-scoped reads (wallet/holds/create_hold). Global admin reports therefore see stale state (see minor issue). A periodic reconcile job would remove the false positive entirely."
+  ],
+  "updated_files": [
+    "/app/backend/tests/test_p01b2_holds.py (new)",
+    "/app/backend/tests/test_p01b2_holds_race.py (new)",
+    "/app/backend/tests/test_p01b2_holds_burst.py (new)",
+    "/app/backend/tests/test_backfill_drift.py (stale static-idempotency-key assertion fixed; now locates Migration entry by posting)"
+  ],
+  "success_rate": {"backend": "98.5% (68/69 tests, 1 intentional failing repro of the integrity false positive)", "frontend": "not tested (backend-only request)"},
+  "seed_data_creation": "Ephemeral users TEST_ta_holds_*/chaos/burst/lazyfp/holds2/nonadmin with ledger-backed balances (100 CC) + sessions; all deleted after the run. Verified 0 leftover TEST_ users/holds/sessions/idem records and 0 residual held_cc mismatches in MongoDB.",
+  "should_call_test_agent_after_fix": false,
+  "should_main_agent_self_test": true,
+  "test_credentials": "Emergent Google auth; tests seed user+session in MongoDB (see /app/memory/test_credentials.md and tests/conftest.py::_mk_user).",
+  "context_for_next_testing_agent": "Verified with TRUE concurrency: (1) 10 concurrent holds of 20 on balance 100 -> accepted<=5, held==20*accepted, rows==accepted, all rejects 400 INSUFFICIENT_AVAILABLE_FUNDS; (2) 2x80 -> exactly 1 winner; (3) 5 concurrent releases -> held 0, no double credit; (4) 5 concurrent captures of 30 on a 50 hold -> exactly 1 success, balance debited once; (5) same Idempotency-Key x5 concurrent -> exactly ONE hold row/one reservation, losers 409 IDEMPOTENCY_IN_PROGRESS, later replay returns the same hold_id; same key + different payload -> 409 IDEMPOTENCY_CONFLICT; failed request does not poison the key; (6) partial capture 40 -> PARTIALLY_CAPTURED/remaining 60/balance 60/held 60, over-capture 61 -> 409, capture 60 -> CAPTURED, re-capture -> 409, history has None->ACTIVE->PARTIALLY_CAPTURED->CAPTURED; (7) release -> RELEASED, 2nd release idempotent, capture after release -> 409 with no balance change; (8) ttl_seconds=1 lazy-expiry frees funds without a worker, capture on expired -> 409, expired funds immediately reusable; (9) 8-iteration capture-vs-expiry race burst (both branches hit: 2 captures won, 6 expiries won) -> held_cc always == sum(remaining active), balance always == 100-captured, never negative, guard hold never freed; (10) chaos load (30 mixed concurrent ops) -> no 5xx, invariants + ledger_balanced hold; (11) capabilities honest (state_machines/holds/idempotency_api REAL, refund PLANNED, settlement PARTIAL, stripe SANDBOX, card MOCK); (12) cross-user capture/release -> 404, admin endpoints -> 403 for non-admin. Run holds suites SERIALLY (-n 0): admin integrity endpoints are GLOBAL and the pytest.ini 2-worker split causes cross-worker false mismatches (also affects backend_test.py::test_wallet_reachable which asserts a fixed 500 CC balance for a module-scoped user).",
+  "rca_of_the_issue": "holds_integrity_report() compares users.held_cc against the sum of remaining amounts of ACTIVE/PARTIALLY_CAPTURED holds with expires_at > now, but it never calls reconcile_expired_holds first. Because expiry is lazy (only triggered by user-scoped reads) and no worker exists, a hold past its TTL still contributes to held_cc while being excluded from 'effective' -> held_mismatch + expired_still_active -> healthy=false -> financial-health severity=CRITICAL. This is a reporting/monitoring defect only: no funds are lost, over-reserved or double-spent, and a single GET /api/wallet (or POST /api/admin/holds/rebuild) self-heals it."
+}

@@ -15,7 +15,7 @@ def drifted_user(mongo):
     uid, token = _mk_user(mongo, "drift", is_admin=False, balance=300.0, with_ledger=False)
     yield {"user_id": uid, "token": token}
     _cleanup(mongo, uid)
-    mongo.ledger_entries.delete_many({"idempotency_key": f"backfill:acct_cash_{uid}"})
+    mongo.ledger_entries.delete_many({"postings.account_id": f"acct_cash_{uid}"})
 
 
 def _integrity(api, admin_token):
@@ -36,7 +36,10 @@ def test_backfill_creates_migration_entry_for_drifted_account(api, admin_user, d
     assert b.status_code == 200, b.text[:300]
     assert b.json()["accounts_backfilled"] >= 1
 
-    entry = mongo.ledger_entries.find_one({"idempotency_key": f"backfill:acct_cash_{uid}"})
+    # NOTE: backfill entries no longer use a static "backfill:<acct>" idempotency key
+    # (that key blocked a 2nd migration); locate the Migration entry by its posting.
+    entry = mongo.ledger_entries.find_one({"category": "Migration",
+                                           "postings.account_id": f"acct_cash_{uid}"})
     assert entry is not None, "no Migration ledger entry created for drifted account"
     assert entry["category"] == "Migration"
     assert "migration" in entry["description"].lower()
@@ -55,8 +58,8 @@ def test_backfill_creates_migration_entry_for_drifted_account(api, admin_user, d
 
 
 def test_backfill_cannot_fix_a_second_drift_on_same_account(api, admin_user, drifted_user, mongo):
-    """Regression check: ledger_post uses a STATIC idempotency_key 'backfill:<acct>',
-    so once an account was backfilled a later drift can never be corrected."""
+    """Regression check: a 2nd drift on an already-backfilled account must still be
+    correctable (no static idempotency key blocking the 2nd migration entry)."""
     h = admin_user["token"]
     uid = drifted_user["user_id"]
 

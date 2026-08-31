@@ -56,3 +56,16 @@ Premium fintech wallet (Revolut/Qonto style) for CVLN Group cultural ecosystem. 
 - system/status enrichi (idempotency_api REAL; holds/refund/reversal/fees/outbox/state_machines PLANNED; settlement PARTIAL).
 - Docs: CVLN-IDEMPOTENCY.md, CVLN-FINANCIAL-INVARIANTS.md.
 - Reste PLANNED (non maquille): state-machine engine, holds/available-balance, refund/reversal/fees engines, settlement externe, reconciliation cases, outbox, Decimal minor-units.
+
+## Update 2026-06 — P0.1-B2 State Machine + Holds / Available Balance (REAL)
+- **Anti-double-spend ATOMIQUE** (Mongo standalone, pas de tx multi-docs): réservation = 1 seul `find_one_and_update` sur `users` (`$expr balance_cc-held_cc >= amount` + `$inc held_cc`). Jamais de read-then-write. Compensation si l'insert du hold échoue.
+- Cache `users.held_cc` (dénormalisé, reconstructible). `available_balance_cc = balance_cc - held_cc`. Exposé dans `GET /api/wallet` (backward-compatible: `balance_cc` conservé).
+- Machine à états Hold: ACTIVE→PARTIALLY_CAPTURED→CAPTURED / RELEASED / EXPIRED. Le champ `status` est le verrou atomique (single-winner) → double capture/release impossibles. Historique append-only `financial_state_history` via `record_state`.
+- Endpoints: `POST /api/holds` (idempotent via Idempotency-Key), `/api/holds/{id}/capture` (partielle/totale, débit ledger via add_transaction), `/api/holds/{id}/release`, `GET /api/holds`, `GET /api/holds/{id}/history`.
+- **Lazy-expiry**: un hold `expires_at<=now` ne bloque plus le disponible immédiatement (sans worker). `reconcile_expired_holds` appelé avant chaque réservation, lecture wallet ET rapport d'intégrité.
+- Intégrité: `GET /api/admin/holds/integrity` + `holds_health` dans `/admin/financial-health` (held>=0, held==Σ remaining actifs non-expirés, held<=balance). `POST /api/admin/holds/rebuild` (Holds→held_cc, un seul sens).
+- Events: Financial.HoldCreated/Captured/PartiallyCaptured/Released/Expired/RejectedInsufficientFunds/IntegrityMismatch.
+- `/api/system/status`: state_machines & holds → REAL. refund/reversal/fees/outbox restent PLANNED, settlement PARTIAL, stripe SANDBOX, card MOCK.
+- Docs: CVLN-FINANCIAL-STATE-MACHINES.md, CVLN-HOLDS-AUTHORIZATION-CAPTURE.md.
+- Vérifié testing_agent iteration_4: 68/69 + 32 tests holds (concurrence réelle: 10×20/100→max 5, 2×80→1 gagnant, idempotency-key concurrent→1 réservation, capture/release/expiry, race capture-vs-expiry, chaos load). 1 défaut trouvé (faux positif intégrité sur hold expiré non lu) → CORRIGÉ (reconcile avant check) et revérifié (32/32 pass).
+- Prochain: P0.1-B3 Refund/Reversal/Fees, puis B4 Settlement/Reconciliation+Outbox, puis B5 Decimal/minor-units + maker/checker.

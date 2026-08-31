@@ -2,6 +2,7 @@ from fastapi import FastAPI, APIRouter, HTTPException, Request, Response, Depend
 from dotenv import load_dotenv
 from starlette.middleware.cors import CORSMiddleware
 from motor.motor_asyncio import AsyncIOMotorClient
+from pymongo import ReturnDocument
 import os
 import logging
 from pathlib import Path
@@ -327,6 +328,9 @@ async def logout(request: Request, response: Response):
 @api_router.get("/wallet")
 async def get_wallet(user: dict = Depends(get_current_user)):
     balance = user.get("balance_cc", 0)
+    available = await available_balance(user)  # runs lazy-expiry, reads fresh held_cc
+    u2 = await db.users.find_one({"user_id": user["user_id"]}, {"_id": 0, "held_cc": 1})
+    held = round(u2.get("held_cc", 0.0), 2)
     coffres_total = 0
     async for c in db.coffres.find({"user_id": user["user_id"]}, {"_id": 0}):
         coffres_total += c.get("amount_cc", 0)
@@ -335,6 +339,8 @@ async def get_wallet(user: dict = Depends(get_current_user)):
     outflow = sum(-t["amount"] for t in txs if t["amount"] < 0)
     return {
         "balance_cc": balance,
+        "held_cc": held,
+        "available_balance_cc": available,
         "value_eur": round(balance * JCC_RATE_EUR, 2),
         "rate": JCC_RATE_EUR,
         "coffres_total": coffres_total,
@@ -601,6 +607,9 @@ async def seed_entities():
     try:
         await db.idempotency_records.create_index("idem_id", unique=True)
         await db.ledger_entries.create_index("idempotency_key", unique=True)
+        await db.balance_holds.create_index("hold_id", unique=True)
+        await db.balance_holds.create_index([("user_id", 1), ("status", 1)])
+        await db.financial_state_history.create_index([("entity_type", 1), ("entity_id", 1)])
     except Exception:
         pass
     count = await db.entities.count_documents({})
@@ -1118,6 +1127,8 @@ async def financial_health(user: dict = Depends(get_current_user)):
     supply_ok = abs(round((circ + coffre_total) + sys_total, 6)) < 1e-6
     idem_total = await db.idempotency_records.count_documents({})
     idem_processing = await db.idempotency_records.count_documents({"state": "PROCESSING"})
+    holds_rep = await holds_integrity_report()
+    active_holds = await db.balance_holds.count_documents({"status": {"$in": ["ACTIVE", "PARTIALLY_CAPTURED"]}})
     return {
         "ledger_balanced": balanced,
         "per_asset_sum": {k: round(v, 6) for k, v in per_asset.items()},
@@ -1127,7 +1138,9 @@ async def financial_health(user: dict = Depends(get_current_user)):
         "pending_withdrawals": await db.withdrawals.count_documents({"status": "pending"}),
         "idempotency_records": idem_total,
         "idempotency_in_progress": idem_processing,
-        "severity": "CRITICAL" if not (balanced and supply_ok) else "INFO",
+        "active_holds": active_holds,
+        "holds_health": holds_rep,
+        "severity": "CRITICAL" if not (balanced and supply_ok and holds_rep["healthy"]) else "INFO",
     }
 
 @api_router.put("/admin/kill-switch")
@@ -1164,6 +1177,73 @@ async def ledger_backfill(user: dict = Depends(get_current_user)):
     return {"ok": True, "accounts_backfilled": fixed}
 
 
+async def holds_integrity_report():
+    """Invariants: held_cc >= 0, held_cc == sum(remaining of active/partial NON-expired holds),
+    held_cc <= balance_cc (available >= 0), no expired hold still counted."""
+    now = datetime.now(timezone.utc).isoformat()
+    held_mismatch, negative_held, over_reserved, expired_active, orphan_held = [], [], [], [], []
+    total_users_with_holds = 0
+    async for u in db.users.find({}, {"user_id": 1, "balance_cc": 1, "held_cc": 1}):
+        uid = u["user_id"]
+        # Lazy-expiry FIRST: an expired hold must never count as reserved (correctness, not maintenance).
+        await reconcile_expired_holds(uid)
+        u = await db.users.find_one({"user_id": uid}, {"_id": 0, "balance_cc": 1, "held_cc": 1})
+        cache = round(u.get("held_cc", 0.0), 2)
+        eff = 0.0
+        exp_cnt = 0
+        async for h in db.balance_holds.find({"user_id": uid, "status": {"$in": ["ACTIVE", "PARTIALLY_CAPTURED"]}},
+                                             {"_id": 0, "amount": 1, "captured": 1, "expires_at": 1}):
+            rem = round(h["amount"] - h.get("captured", 0.0), 2)
+            if h.get("expires_at", "") <= now:
+                exp_cnt += 1
+            else:
+                eff += rem
+        eff = round(eff, 2)
+        if cache != 0 or eff != 0:
+            total_users_with_holds += 1
+        if cache < -1e-6:
+            negative_held.append({"user_id": uid, "held_cc": cache})
+        if abs(cache - eff) > 0.01:
+            held_mismatch.append({"user_id": uid, "cache": cache, "effective": eff})
+        if cache - u.get("balance_cc", 0) > 0.01:
+            over_reserved.append({"user_id": uid, "held_cc": cache, "balance_cc": u.get("balance_cc", 0)})
+        if exp_cnt > 0:
+            expired_active.append({"user_id": uid, "expired_still_active": exp_cnt})
+    return {
+        "users_with_holds": total_users_with_holds,
+        "held_mismatch": held_mismatch, "negative_held": negative_held,
+        "over_reserved": over_reserved, "expired_still_active": expired_active,
+        "healthy": not (held_mismatch or negative_held or over_reserved or expired_active),
+    }
+
+@api_router.get("/admin/holds/integrity")
+async def holds_integrity(user: dict = Depends(get_current_user)):
+    await require_admin(user)
+    rep = await holds_integrity_report()
+    if not rep["healthy"]:
+        await audit(user["user_id"], "Financial.HoldIntegrityMismatch", {k: len(v) for k, v in rep.items() if isinstance(v, list)})
+    return rep
+
+@api_router.post("/admin/holds/rebuild")
+async def holds_rebuild(user: dict = Depends(get_current_user)):
+    """Safe repair, ONE direction only: Holds -> held_cc cache. Never invents/edits holds.
+    Reconciles expired holds first, then recomputes held_cc from effective active reservations."""
+    await require_admin(user)
+    rebuilt = 0
+    async for u in db.users.find({}, {"user_id": 1}):
+        uid = u["user_id"]
+        await reconcile_expired_holds(uid)
+        eff = 0.0
+        async for h in db.balance_holds.find({"user_id": uid, "status": {"$in": ["ACTIVE", "PARTIALLY_CAPTURED"]}},
+                                             {"_id": 0, "amount": 1, "captured": 1}):
+            eff += h["amount"] - h.get("captured", 0.0)
+        eff = round(eff, 2)
+        cur = await db.users.find_one({"user_id": uid}, {"_id": 0, "held_cc": 1})
+        if abs(cur.get("held_cc", 0.0) - eff) > 0.005:
+            await db.users.update_one({"user_id": uid}, {"$set": {"held_cc": eff}})
+            rebuilt += 1
+    return {"ok": True, "users_rebuilt": rebuilt}
+
 
 # ---- System status: BUILD vs ACTIVATION tracks (honest capability statuses) ----
 FEATURE_FLAGS = {
@@ -1185,7 +1265,7 @@ CAPABILITY_STATUS = {
     "invest": "PLANNED", "crypto": "PLANNED", "fx": "PLANNED",
     "business": "PLANNED", "rwa": "PLANNED", "open_banking": "PLANNED",
     "reconciliation": "PARTIAL", "reporting": "PARTIAL",
-    "idempotency_api": "REAL", "state_machines": "PLANNED", "holds": "PLANNED",
+    "idempotency_api": "REAL", "state_machines": "REAL", "holds": "REAL",
     "refund_engine": "PLANNED", "reversal_engine": "PLANNED", "settlement_engine": "PARTIAL",
     "fees_engine": "PLANNED", "outbox_events": "PLANNED", "account_registry": "PARTIAL",
     "asset_registry": "PARTIAL",
@@ -1217,6 +1297,172 @@ async def wallet_eligibility(user: dict = Depends(get_current_user)):
 async def wallet_provision(platform: str, user: dict = Depends(get_current_user)):
     await audit(user["user_id"], "MobileWallet.ProvisioningFailed", {"platform": platform, "reason": "no_issuer"})
     raise HTTPException(status_code=501, detail=f"Provisioning {platform} indisponible (statut PLANNED : issuer/processor requis).")
+
+
+# ================= P0.1-B2: STATE MACHINE + HOLDS / AVAILABLE BALANCE =================
+# Central state machine. Terminal states never leave. Transitions are enforced ATOMICALLY
+# at the DB layer via conditional find_one_and_update (the status field is the lock),
+# not via read-then-write. Standalone MongoDB has NO multi-doc transactions, so cross-doc
+# consistency (users.held_cc <-> balance_holds) uses a deterministic compensation strategy:
+# the atomic status flip (single winner) is done FIRST, then held_cc is adjusted. A crash
+# in the window can only UNDER-release (funds stay locked), never over-release/double-spend;
+# the Integrity Engine detects and the rebuild endpoint repairs (Holds -> held_cc, one way).
+HOLD_TRANSITIONS = {
+    "ACTIVE": {"CAPTURED", "PARTIALLY_CAPTURED", "RELEASED", "EXPIRED"},
+    "PARTIALLY_CAPTURED": {"CAPTURED", "RELEASED", "EXPIRED"},
+    "CAPTURED": set(), "RELEASED": set(), "EXPIRED": set(),
+}
+
+async def record_state(entity_type, entity_id, prev, new, actor, reason="", correlation_id=None):
+    # Append-only financial state history (never rewritten).
+    await db.financial_state_history.insert_one({
+        "entity_type": entity_type, "entity_id": entity_id,
+        "previous_state": prev, "new_state": new, "actor": actor, "reason": reason,
+        "correlation_id": correlation_id,
+        "created_at": datetime.now(timezone.utc).isoformat()})
+
+def assert_transition(allowed_map, current, new):
+    if new not in allowed_map.get(current, set()):
+        raise HTTPException(status_code=409, detail=f"INVALID_STATE_TRANSITION:{current}->{new}")
+
+async def _terminate_hold(hold_id: str, terminal: str, actor: str, reason: str = ""):
+    """Atomically move an ACTIVE/PARTIALLY_CAPTURED hold to a terminal state (RELEASED/EXPIRED)
+    and release its remaining reserved amount from held_cc. Idempotent: only ONE caller wins
+    the status flip, so double release/expire is impossible."""
+    now = datetime.now(timezone.utc).isoformat()
+    res = await db.balance_holds.find_one_and_update(
+        {"hold_id": hold_id, "status": {"$in": ["ACTIVE", "PARTIALLY_CAPTURED"]}},
+        {"$set": {"status": terminal, "released_at": now}},
+        return_document=ReturnDocument.AFTER)
+    if not res:
+        return None  # already terminal -> nothing to release (idempotent)
+    remaining = round(res["amount"] - res.get("captured", 0.0), 2)
+    prev = "PARTIALLY_CAPTURED" if res.get("captured", 0) > 0 else "ACTIVE"
+    if remaining > 0:
+        await db.users.update_one({"user_id": res["user_id"]}, {"$inc": {"held_cc": -remaining}})
+    await record_state("hold", hold_id, prev, terminal, actor, reason)
+    ev = "Financial.HoldExpired" if terminal == "EXPIRED" else "Financial.HoldReleased"
+    await audit(res["user_id"], ev, {"hold_id": hold_id, "released_amount": remaining})
+    return res
+
+async def reconcile_expired_holds(user_id: str):
+    """Lazy-expiry: expiry is correctness, cleanup is maintenance. Any hold past expires_at
+    stops reducing available balance immediately, even if no worker has run yet."""
+    now = datetime.now(timezone.utc).isoformat()
+    async for h in db.balance_holds.find(
+            {"user_id": user_id, "status": {"$in": ["ACTIVE", "PARTIALLY_CAPTURED"]}, "expires_at": {"$lte": now}},
+            {"_id": 0, "hold_id": 1}):
+        await _terminate_hold(h["hold_id"], "EXPIRED", "system", "ttl_expired")
+
+async def available_balance(user: dict) -> float:
+    await reconcile_expired_holds(user["user_id"])
+    u = await db.users.find_one({"user_id": user["user_id"]}, {"_id": 0, "balance_cc": 1, "held_cc": 1})
+    return round(u.get("balance_cc", 0) - u.get("held_cc", 0.0), 2)
+
+class HoldCreate(BaseModel):
+    amount: float
+    reason: str = ""
+    ttl_seconds: Optional[int] = None
+
+class HoldCapture(BaseModel):
+    amount: Optional[float] = None
+
+@api_router.post("/holds")
+async def create_hold(req: HoldCreate, request: Request, user: dict = Depends(get_current_user)):
+    idem_id, cached = await idem_begin(request, user, "hold", req.dict())
+    if cached is not None:
+        return cached
+    try:
+        if req.amount <= 0:
+            raise HTTPException(status_code=400, detail="Montant invalide")
+        amount = round(req.amount, 2)
+        uid = user["user_id"]
+        # Lazy-expiry BEFORE reserving so freed funds are usable immediately.
+        await reconcile_expired_holds(uid)
+        # ATOMIC reservation: check available (balance-held) AND increment held in ONE op.
+        updated = await db.users.find_one_and_update(
+            {"user_id": uid,
+             "$expr": {"$gte": [{"$subtract": ["$balance_cc", {"$ifNull": ["$held_cc", 0]}]}, amount]}},
+            {"$inc": {"held_cc": amount}},
+            return_document=ReturnDocument.AFTER)
+        if not updated:
+            await audit(uid, "Financial.HoldRejectedInsufficientFunds", {"amount": amount})
+            raise HTTPException(status_code=400, detail="INSUFFICIENT_AVAILABLE_FUNDS")
+        exp = datetime.now(timezone.utc) + timedelta(seconds=req.ttl_seconds if req.ttl_seconds else 24 * 3600)
+        hold = {"hold_id": f"hold_{uuid.uuid4().hex[:10]}", "user_id": uid, "asset": DEFAULT_ASSET,
+                "amount": amount, "captured": 0.0, "status": "ACTIVE", "reason": req.reason,
+                "correlation_id": f"corr_{uuid.uuid4().hex[:10]}",
+                "created_at": datetime.now(timezone.utc).isoformat(), "expires_at": exp.isoformat()}
+        try:
+            await db.balance_holds.insert_one(dict(hold))
+        except Exception:
+            # Compensation: reservation succeeded but hold row failed -> give funds back.
+            await db.users.update_one({"user_id": uid}, {"$inc": {"held_cc": -amount}})
+            raise
+        await record_state("hold", hold["hold_id"], None, "ACTIVE", uid, req.reason, hold["correlation_id"])
+        await audit(uid, "Financial.HoldCreated", {"hold_id": hold["hold_id"], "amount": amount})
+        hold.pop("_id", None)
+        return await idem_finish(idem_id, hold)
+    except HTTPException:
+        await idem_fail(idem_id)
+        raise
+    except Exception:
+        await idem_fail(idem_id)
+        raise
+
+@api_router.post("/holds/{hold_id}/capture")
+async def capture_hold(hold_id: str, req: HoldCapture, user: dict = Depends(get_current_user)):
+    uid = user["user_id"]
+    h = await db.balance_holds.find_one({"hold_id": hold_id, "user_id": uid}, {"_id": 0})
+    if not h:
+        raise HTTPException(status_code=404, detail="HOLD_NOT_FOUND")
+    remaining0 = round(h["amount"] - h.get("captured", 0.0), 2)
+    amt = round(req.amount if req.amount is not None else remaining0, 2)
+    if amt <= 0:
+        raise HTTPException(status_code=400, detail="Montant de capture invalide")
+    # ATOMIC claim: only succeeds while hold is capturable AND has enough remaining.
+    res = await db.balance_holds.find_one_and_update(
+        {"hold_id": hold_id, "user_id": uid, "status": {"$in": ["ACTIVE", "PARTIALLY_CAPTURED"]},
+         "$expr": {"$gte": [{"$subtract": ["$amount", {"$ifNull": ["$captured", 0]}]}, amt]}},
+        {"$inc": {"captured": amt}},
+        return_document=ReturnDocument.AFTER)
+    if not res:
+        raise HTTPException(status_code=409, detail="CAPTURE_INVALID (état terminal ou montant > restant)")
+    prev = "PARTIALLY_CAPTURED" if res.get("captured", 0) - amt > 0 else "ACTIVE"
+    new_captured = round(res["captured"], 2)
+    final = "CAPTURED" if abs(new_captured - res["amount"]) < 1e-6 else "PARTIALLY_CAPTURED"
+    await db.balance_holds.update_one(
+        {"hold_id": hold_id, "status": {"$in": ["ACTIVE", "PARTIALLY_CAPTURED"]}},
+        {"$set": {"status": final}})
+    # Captured funds become a real spend: release from held AND debit balance via the ledger.
+    await db.users.update_one({"user_id": uid}, {"$inc": {"held_cc": -amt}})
+    await add_transaction(uid, f"Capture hold — {h.get('reason','')}", -amt, "Hold")
+    await record_state("hold", hold_id, prev, final, uid, "", res.get("correlation_id"))
+    ev = "Financial.HoldCaptured" if final == "CAPTURED" else "Financial.HoldPartiallyCaptured"
+    await audit(uid, ev, {"hold_id": hold_id, "amount": amt, "captured_total": new_captured})
+    return {"ok": True, "hold_id": hold_id, "captured": new_captured,
+            "remaining": round(res["amount"] - new_captured, 2), "status": final}
+
+@api_router.post("/holds/{hold_id}/release")
+async def release_hold(hold_id: str, user: dict = Depends(get_current_user)):
+    h = await db.balance_holds.find_one({"hold_id": hold_id, "user_id": user["user_id"]}, {"_id": 0})
+    if not h:
+        raise HTTPException(status_code=404, detail="HOLD_NOT_FOUND")
+    res = await _terminate_hold(hold_id, "RELEASED", user["user_id"], "manual_release")
+    if not res:
+        # Idempotent: already terminal.
+        cur = await db.balance_holds.find_one({"hold_id": hold_id}, {"_id": 0, "status": 1})
+        return {"ok": True, "status": cur["status"], "idempotent": True}
+    return {"ok": True, "status": "RELEASED"}
+
+@api_router.get("/holds")
+async def list_holds(user: dict = Depends(get_current_user)):
+    await reconcile_expired_holds(user["user_id"])
+    return await db.balance_holds.find({"user_id": user["user_id"]}, {"_id": 0}).sort("created_at", -1).to_list(100)
+
+@api_router.get("/holds/{hold_id}/history")
+async def hold_history(hold_id: str, user: dict = Depends(get_current_user)):
+    return await db.financial_state_history.find({"entity_type": "hold", "entity_id": hold_id}, {"_id": 0}).sort("created_at", 1).to_list(100)
 
 
 app.include_router(api_router)
