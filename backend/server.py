@@ -247,6 +247,8 @@ async def create_session(request: Request, response: Response):
             "frek_level": "Créateur Premium",
             "balance_cc": 0.0,
             "is_admin": email == ADMIN_EMAIL,
+            "kyc_status": "not_started",
+            "kyc_level": 0,
             "created_at": datetime.now(timezone.utc).isoformat(),
         })
         await seed_user_data(user_id)
@@ -1014,6 +1016,41 @@ async def ledger_integrity(user: dict = Depends(get_current_user)):
     return {"balanced": balanced, "per_asset_sum": per_asset, "entries": total_entries,
             "cache_mismatches": mism, "system_accounts": {k: await ledger_balance(v) for k, v in SYSTEM_ACCOUNTS.items()}}
 
+
+# ---- System status: BUILD vs ACTIVATION tracks (honest capability statuses) ----
+FEATURE_FLAGS = {
+    "LEDGER": True, "PAYMENTS_STRIPE": True, "CARD": True, "AGENTS": True,
+    "WITHDRAWALS": True, "INVEST": False, "CRYPTO": False, "FX": False,
+    "BUSINESS": False, "RWA": False, "APPLE_PAY": False, "GOOGLE_PAY": False,
+    "KYC": False, "OPEN_BANKING": False,
+}
+CAPABILITY_STATUS = {
+    "financial_core_ledger": "REAL",
+    "jcc_internal": "REAL",
+    "payments_deposit_stripe": "SANDBOX",
+    "withdrawals": "MANUAL_ADMIN",          # real IBAN payouts need Stripe Connect (ACTIVATION)
+    "virtual_card_ledger": "REAL",
+    "card_issuing": "MOCK",                  # needs issuer/processor (ACTIVATION)
+    "apple_google_pay": "PLANNED",
+    "agents_factory": "REAL",
+    "kyc_aml": "PLANNED",                    # needs KYC provider + legal (ACTIVATION)
+    "invest": "PLANNED", "crypto": "PLANNED", "fx": "PLANNED",
+    "business": "PLANNED", "rwa": "PLANNED", "open_banking": "PLANNED",
+    "reconciliation": "PARTIAL", "reporting": "PARTIAL",
+}
+
+@api_router.get("/system/status")
+async def system_status(user: dict = Depends(get_current_user)):
+    return {"feature_flags": FEATURE_FLAGS, "capabilities": CAPABILITY_STATUS,
+            "tracks": {"build": ["Ledger✓", "Invest", "Crypto", "FX", "Business", "RWA"],
+                       "activation": ["Legal structure", "KYC/AML", "Issuer", "Card processor",
+                                       "Apple/Google", "Broker", "CASP/Custodian", "Banking/Open-banking", "Certifications"]}}
+
+@api_router.get("/me/kyc")
+async def my_kyc(user: dict = Depends(get_current_user)):
+    # KYC is PLANNED: no real verification provider connected yet.
+    return {"status": user.get("kyc_status", "not_started"), "level": user.get("kyc_level", 0),
+            "provider": "PLANNED", "note": "Vérification d'identité non active (nécessite un provider KYC + structure juridique)."}
 
 @api_router.get("/card/wallet-eligibility")
 async def wallet_eligibility(user: dict = Depends(get_current_user)):
