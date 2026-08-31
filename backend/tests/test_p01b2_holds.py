@@ -416,7 +416,8 @@ class TestSystemStatus:
         assert r.status_code == 200, r.text[:300]
         caps = r.json()["capabilities"]
         expected = {"state_machines": "REAL", "holds": "REAL", "idempotency_api": "REAL",
-                    "refund_engine": "PLANNED", "settlement_engine": "PARTIAL",
+                    "refund_engine": "REAL", "reversal_engine": "REAL", "fees_engine": "REAL",
+                    "settlement_engine": "PARTIAL", "outbox_events": "PLANNED",
                     "payments_deposit_stripe": "SANDBOX", "card_issuing": "MOCK"}
         for k, v in expected.items():
             assert caps.get(k) == v, f"{k} = {caps.get(k)}, expected {v}"

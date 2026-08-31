@@ -721,17 +721,45 @@ async def create_withdrawal(req: WithdrawRequest, request: Request, user: dict =
     try:
         if req.amount_cc <= 0:
             raise HTTPException(status_code=400, detail="Montant invalide")
-        if req.amount_cc > user.get("balance_cc", 0):
-            raise HTTPException(status_code=400, detail="Solde insuffisant")
         st = await get_settings()
-        eur = round(req.amount_cc * st["rate_eur"], 2)
-        await add_transaction(user["user_id"], f"Retrait demandé — {req.amount_cc} CC", -req.amount_cc, "Retrait")
-        doc = {"wd_id": f"wd_{uuid.uuid4().hex[:10]}", "user_id": user["user_id"], "user_name": user.get("name"),
-               "frek_id": user.get("frek_id"), "amount_cc": req.amount_cc, "amount_eur": eur,
-               "iban": req.iban, "status": "pending", "created_at": datetime.now(timezone.utc).isoformat()}
-        await db.withdrawals.insert_one(doc)
-        doc.pop("_id", None)
-        return await idem_finish(idem_id, {"ok": True, "withdrawal": doc})
+        fee = _compute_fee(st.get("fee_policy", {}) or {}, "withdrawal", req.amount_cc)
+        total = round(req.amount_cc + fee, 2)
+        uid = user["user_id"]
+        # ATOMIC available-balance enforcement: debit (amount+fee) only if (balance - held) covers it.
+        # Honours B2 holds and is race-safe (single conditional find_one_and_update).
+        res = await db.users.find_one_and_update(
+            {"user_id": uid,
+             "$expr": {"$gte": [{"$subtract": ["$balance_cc", {"$ifNull": ["$held_cc", 0]}]}, total]}},
+            {"$inc": {"balance_cc": -total}}, return_document=ReturnDocument.AFTER)
+        if not res:
+            raise HTTPException(status_code=400, detail="Solde disponible insuffisant (montant + frais)")
+        debited_total = total
+        try:
+            now = datetime.now(timezone.utc).isoformat()
+            eur = round(req.amount_cc * st["rate_eur"], 2)
+            wtx = f"tx_{uuid.uuid4().hex[:10]}"
+            await db.transactions.insert_one({"tx_id": wtx, "user_id": uid, "label": f"Retrait demandé — {req.amount_cc} CC",
+                                              "amount": -req.amount_cc, "category": "Retrait", "type": "out", "created_at": now})
+            await ledger_post(f"Retrait demandé — {req.amount_cc} CC", "Retrait",
+                              [(cash_acct(uid), -req.amount_cc), (_counter_account("Retrait"), req.amount_cc)], ref=wtx)
+            fee_tx = None
+            if fee > 0:
+                fee_tx = f"tx_{uuid.uuid4().hex[:10]}"
+                await db.transactions.insert_one({"tx_id": fee_tx, "user_id": uid, "label": "Frais — withdrawal",
+                                                  "amount": -fee, "category": "Frais", "type": "out", "created_at": now})
+                await ledger_post("Frais — withdrawal", "Frais",
+                                  [(cash_acct(uid), -fee), (SYSTEM_ACCOUNTS["revenue"], fee)], ref=fee_tx)
+                await audit(uid, "Financial.FeeApplied", {"operation": "withdrawal", "fee": fee, "base": req.amount_cc, "ref": wtx})
+            doc = {"wd_id": f"wd_{uuid.uuid4().hex[:10]}", "user_id": uid, "user_name": user.get("name"),
+                   "frek_id": user.get("frek_id"), "amount_cc": req.amount_cc, "amount_eur": eur, "fee_cc": fee,
+                   "fee_tx_id": fee_tx, "iban": req.iban, "status": "pending", "created_at": now}
+            await db.withdrawals.insert_one(doc)
+            doc.pop("_id", None)
+            return await idem_finish(idem_id, {"ok": True, "withdrawal": doc})
+        except Exception:
+            # Compensation: restore the atomically-debited amount if post-debit work fails.
+            await db.users.update_one({"user_id": uid}, {"$inc": {"balance_cc": debited_total}})
+            raise
     except Exception:
         await idem_fail(idem_id)
         raise
@@ -775,19 +803,35 @@ async def admin_withdrawals(user: dict = Depends(get_current_user)):
 @api_router.post("/admin/withdrawals/{wd_id}/approve")
 async def admin_approve_wd(wd_id: str, user: dict = Depends(get_current_user)):
     await require_admin(user)
-    wd = await db.withdrawals.find_one({"wd_id": wd_id}, {"_id": 0})
-    if not wd or wd["status"] != "pending":
+    # ATOMIC status transition is the lock: only the winner processes (no double action).
+    wd = await db.withdrawals.find_one_and_update(
+        {"wd_id": wd_id, "status": "pending"},
+        {"$set": {"status": "processed", "processed_at": datetime.now(timezone.utc).isoformat()}})
+    if not wd:
         raise HTTPException(status_code=404, detail="Demande introuvable ou déjà traitée")
-    await db.withdrawals.update_one({"wd_id": wd_id}, {"$set": {"status": "processed", "processed_at": datetime.now(timezone.utc).isoformat()}})
     return {"ok": True}
 
 @api_router.post("/admin/withdrawals/{wd_id}/reject")
 async def admin_reject_wd(wd_id: str, user: dict = Depends(get_current_user)):
     await require_admin(user)
-    wd = await db.withdrawals.find_one({"wd_id": wd_id}, {"_id": 0})
-    if not wd or wd["status"] != "pending":
+    # ATOMIC: flip pending->rejected FIRST; only the single winner credits back (no double refund).
+    wd = await db.withdrawals.find_one_and_update(
+        {"wd_id": wd_id, "status": "pending"},
+        {"$set": {"status": "rejected", "processed_at": datetime.now(timezone.utc).isoformat()}})
+    if not wd:
         raise HTTPException(status_code=404, detail="Demande introuvable ou déjà traitée")
     await add_transaction(wd["user_id"], f"Retrait refusé — remboursement {wd['amount_cc']} CC", wd["amount_cc"], "Retrait")
+    fee_cc = wd.get("fee_cc", 0) or 0
+    if fee_cc > 0:
+        # Reverse the withdrawal fee too: a rejected withdrawal must not cost the user the fee.
+        ftx = f"tx_{uuid.uuid4().hex[:10]}"
+        await db.transactions.insert_one({"tx_id": ftx, "user_id": wd["user_id"],
+                                          "label": f"Frais retrait remboursés — {fee_cc} CC", "amount": fee_cc,
+                                          "category": "Frais", "type": "in",
+                                          "created_at": datetime.now(timezone.utc).isoformat()})
+        await ledger_post(f"Frais retrait remboursés — {fee_cc} CC", "Frais",
+                          [(cash_acct(wd["user_id"]), fee_cc), (SYSTEM_ACCOUNTS["revenue"], -fee_cc)], ref=ftx)
+        await db.users.update_one({"user_id": wd["user_id"]}, {"$inc": {"balance_cc": fee_cc}})
     await db.withdrawals.update_one({"wd_id": wd_id}, {"$set": {"status": "rejected", "processed_at": datetime.now(timezone.utc).isoformat()}})
     return {"ok": True}
 
@@ -1139,6 +1183,8 @@ async def financial_health(user: dict = Depends(get_current_user)):
         "idempotency_records": idem_total,
         "idempotency_in_progress": idem_processing,
         "active_holds": active_holds,
+        "refunds": await db.refunds.count_documents({}),
+        "reversals": await db.reversals.count_documents({}),
         "holds_health": holds_rep,
         "severity": "CRITICAL" if not (balanced and supply_ok and holds_rep["healthy"]) else "INFO",
     }
@@ -1266,8 +1312,8 @@ CAPABILITY_STATUS = {
     "business": "PLANNED", "rwa": "PLANNED", "open_banking": "PLANNED",
     "reconciliation": "PARTIAL", "reporting": "PARTIAL",
     "idempotency_api": "REAL", "state_machines": "REAL", "holds": "REAL",
-    "refund_engine": "PLANNED", "reversal_engine": "PLANNED", "settlement_engine": "PARTIAL",
-    "fees_engine": "PLANNED", "outbox_events": "PLANNED", "account_registry": "PARTIAL",
+    "refund_engine": "REAL", "reversal_engine": "REAL", "settlement_engine": "PARTIAL",
+    "fees_engine": "REAL", "outbox_events": "PLANNED", "account_registry": "PARTIAL",
     "asset_registry": "PARTIAL",
 }
 
@@ -1463,6 +1509,220 @@ async def list_holds(user: dict = Depends(get_current_user)):
 @api_router.get("/holds/{hold_id}/history")
 async def hold_history(hold_id: str, user: dict = Depends(get_current_user)):
     return await db.financial_state_history.find({"entity_type": "hold", "entity_id": hold_id}, {"_id": 0}).sort("created_at", 1).to_list(100)
+
+
+# ================= P0.1-B3: FEES + REFUND + REVERSAL =================
+# All value movements go through the double-entry ledger. Refund/Reversal have their own
+# state and atomic single-doc guards on the ORIGINAL transaction (cumulative refunded / reversed
+# flag) so they can never over-refund or double-reverse under concurrency.
+
+async def _fee_policy() -> dict:
+    st = await get_settings()
+    return st.get("fee_policy", {}) or {}
+
+def _compute_fee(policy: dict, operation: str, base: float) -> float:
+    cfg = policy.get(operation) or {}
+    fee = round(base * cfg.get("pct", 0.0) + cfg.get("flat", 0.0), 2)
+    return fee if fee > 0 else 0.0
+
+async def apply_fee(user_id: str, operation: str, base: float, ref: str = None, enforce: bool = True) -> float:
+    """Charge a configurable fee via the Financial Core (user cash -> revenue). Returns fee charged.
+    enforce=True debits atomically only if available (balance-held) covers it."""
+    fee = _compute_fee(await _fee_policy(), operation, base)
+    if fee <= 0:
+        return 0.0
+    if enforce:
+        res = await db.users.find_one_and_update(
+            {"user_id": user_id,
+             "$expr": {"$gte": [{"$subtract": ["$balance_cc", {"$ifNull": ["$held_cc", 0]}]}, fee]}},
+            {"$inc": {"balance_cc": -fee}}, return_document=ReturnDocument.AFTER)
+        if not res:
+            raise HTTPException(status_code=400, detail="FEE_INSUFFICIENT_AVAILABLE")
+    else:
+        await db.users.update_one({"user_id": user_id}, {"$inc": {"balance_cc": -fee}})
+    tx = {"tx_id": f"tx_{uuid.uuid4().hex[:10]}", "user_id": user_id, "label": f"Frais — {operation}",
+          "amount": -fee, "category": "Frais", "type": "out", "created_at": datetime.now(timezone.utc).isoformat()}
+    await db.transactions.insert_one(dict(tx))
+    await ledger_post(f"Frais — {operation}", "Frais",
+                      [(cash_acct(user_id), -fee), (SYSTEM_ACCOUNTS["revenue"], fee)], ref=tx["tx_id"])
+    await audit(user_id, "Financial.FeeApplied", {"operation": operation, "fee": fee, "base": base, "ref": ref})
+    return fee
+
+class FeeQuote(BaseModel):
+    operation: str
+    amount: float
+
+@api_router.post("/fees/quote")
+async def fee_quote(req: FeeQuote, user: dict = Depends(get_current_user)):
+    fee = _compute_fee(await _fee_policy(), req.operation, req.amount)
+    return {"operation": req.operation, "base": req.amount, "fee": fee, "net": round(req.amount - fee, 2)}
+
+@api_router.get("/admin/fees")
+async def admin_get_fees(user: dict = Depends(get_current_user)):
+    await require_admin(user)
+    return {"fee_policy": await _fee_policy()}
+
+@api_router.put("/admin/fees")
+async def admin_set_fees(req: dict, user: dict = Depends(get_current_user)):
+    await require_admin(user)
+    policy = req.get("fee_policy", {})
+    if not isinstance(policy, dict):
+        raise HTTPException(status_code=400, detail="fee_policy invalide")
+    allowed_ops = {"withdrawal", "capture", "marketplace", "conversion", "transfer", "deposit"}
+    clean = {}
+    for op, cfg in policy.items():
+        if op not in allowed_ops:
+            raise HTTPException(status_code=400, detail=f"Opération de frais inconnue: {op}")
+        pct = float(cfg.get("pct", 0.0))
+        flat = float(cfg.get("flat", 0.0))
+        if not (0.0 <= pct <= 1.0) or flat < 0:
+            raise HTTPException(status_code=400, detail="pct doit être entre 0 et 1, flat >= 0")
+        clean[op] = {"pct": pct, "flat": flat}
+    await db.settings.update_one({"key": "app"}, {"$set": {"fee_policy": clean}}, upsert=True)
+    await audit(user["user_id"], "Financial.FeePolicyUpdated", {"fee_policy": clean})
+    return {"ok": True, "fee_policy": clean}
+
+async def _original_tx_and_entry(tx_id: str):
+    orig = await db.transactions.find_one({"tx_id": tx_id}, {"_id": 0})
+    entry = await db.ledger_entries.find_one({"ref": tx_id}, {"_id": 0})
+    return orig, entry
+
+def _cash_and_counter(entry: dict):
+    cash = counter = None
+    for p in entry["postings"]:
+        if p["account_id"].startswith("acct_cash_"):
+            cash = p
+        else:
+            counter = p
+    return cash, counter
+
+class RefundRequest(BaseModel):
+    original_tx_id: str
+    amount: Optional[float] = None
+    reason: str = ""
+
+@api_router.post("/refunds")
+async def create_refund(req: RefundRequest, request: Request, user: dict = Depends(get_current_user)):
+    await require_admin(user)
+    idem_id, cached = await idem_begin(request, user, "refund", req.dict())
+    if cached is not None:
+        return cached
+    try:
+        orig, entry = await _original_tx_and_entry(req.original_tx_id)
+        if not orig:
+            raise HTTPException(status_code=404, detail="TRANSACTION_NOT_FOUND")
+        if orig["amount"] >= 0:
+            raise HTTPException(status_code=400, detail="ONLY_OUTFLOW_REFUNDABLE")
+        if not entry or len(entry.get("postings", [])) != 2:
+            raise HTTPException(status_code=400, detail="LEDGER_ENTRY_UNSUPPORTED")
+        principal = round(-orig["amount"], 2)
+        refund_amt = round(req.amount if req.amount is not None else principal, 2)
+        if refund_amt <= 0:
+            raise HTTPException(status_code=400, detail="Montant de remboursement invalide")
+        cash, counter = _cash_and_counter(entry)
+        if not cash or not counter:
+            raise HTTPException(status_code=400, detail="LEDGER_ENTRY_UNSUPPORTED")
+        target_user = orig["user_id"]
+        # ATOMIC cumulative guard on the ORIGINAL tx: refunded + amt <= principal, and not reversed.
+        guard = await db.transactions.find_one_and_update(
+            {"tx_id": req.original_tx_id, "reversed": {"$ne": True},
+             "$expr": {"$lte": [{"$add": [{"$ifNull": ["$refunded_cc", 0]}, refund_amt]}, principal]}},
+            {"$inc": {"refunded_cc": refund_amt}}, return_document=ReturnDocument.AFTER)
+        if not guard:
+            await audit(target_user, "Financial.RefundRejected",
+                        {"original_tx_id": req.original_tx_id, "amount": refund_amt, "reason": "exceeds_or_reversed"})
+            raise HTTPException(status_code=409, detail="REFUND_EXCEEDS_PRINCIPAL_OR_REVERSED")
+        try:
+            rid = f"rf_{uuid.uuid4().hex[:10]}"
+            corr = f"corr_{uuid.uuid4().hex[:10]}"
+            # Reverse the cash leg (credit user) against the original counterparty.
+            await ledger_post(f"Remboursement — {orig.get('label','')}", "Remboursement",
+                              [(cash_acct(target_user), refund_amt), (counter["account_id"], -refund_amt)], ref=rid)
+            await db.users.update_one({"user_id": target_user}, {"$inc": {"balance_cc": refund_amt}})
+            await db.transactions.insert_one({
+                "tx_id": f"tx_{uuid.uuid4().hex[:10]}", "user_id": target_user,
+                "label": f"Remboursement — {orig.get('label','')}", "amount": refund_amt,
+                "category": "Remboursement", "type": "in", "ref": rid,
+                "created_at": datetime.now(timezone.utc).isoformat()})
+            fully = abs(round(guard.get("refunded_cc", 0), 2) - principal) < 1e-6
+            rec = {"refund_id": rid, "original_tx_id": req.original_tx_id, "user_id": target_user,
+                   "amount": refund_amt, "status": "COMPLETED", "reason": req.reason, "correlation_id": corr,
+                   "fully_refunded": fully, "created_at": datetime.now(timezone.utc).isoformat()}
+            await db.refunds.insert_one(dict(rec))
+            await record_state("refund", rid, "REQUESTED", "COMPLETED", user["user_id"], req.reason, corr)
+            await audit(target_user, "Financial.RefundCompleted",
+                        {"refund_id": rid, "original_tx_id": req.original_tx_id, "amount": refund_amt})
+            return await idem_finish(idem_id, rec)
+        except Exception:
+            # Compensation: give the reserved principal back to the guard counter if posting failed.
+            await db.transactions.update_one({"tx_id": req.original_tx_id}, {"$inc": {"refunded_cc": -refund_amt}})
+            raise
+    except Exception:
+        await idem_fail(idem_id)
+        raise
+
+@api_router.get("/refunds")
+async def list_refunds(user: dict = Depends(get_current_user)):
+    await require_admin(user)
+    return await db.refunds.find({}, {"_id": 0}).sort("created_at", -1).to_list(200)
+
+class ReversalRequest(BaseModel):
+    original_tx_id: str
+    reason: str = ""
+
+@api_router.post("/reversals")
+async def create_reversal(req: ReversalRequest, request: Request, user: dict = Depends(get_current_user)):
+    await require_admin(user)
+    idem_id, cached = await idem_begin(request, user, "reversal", req.dict())
+    if cached is not None:
+        return cached
+    try:
+        orig, entry = await _original_tx_and_entry(req.original_tx_id)
+        if not orig:
+            raise HTTPException(status_code=404, detail="TRANSACTION_NOT_FOUND")
+        if not entry or len(entry.get("postings", [])) != 2:
+            raise HTTPException(status_code=400, detail="LEDGER_ENTRY_UNSUPPORTED")
+        # ATOMIC: reverse exactly once, and only if untouched by refunds.
+        guard = await db.transactions.find_one_and_update(
+            {"tx_id": req.original_tx_id, "reversed": {"$ne": True},
+             "$expr": {"$eq": [{"$ifNull": ["$refunded_cc", 0]}, 0]}},
+            {"$set": {"reversed": True}}, return_document=ReturnDocument.AFTER)
+        if not guard:
+            raise HTTPException(status_code=409, detail="ALREADY_REVERSED_OR_REFUNDED")
+        try:
+            cash, _ = _cash_and_counter(entry)
+            rvid = f"rv_{uuid.uuid4().hex[:10]}"
+            corr = f"corr_{uuid.uuid4().hex[:10]}"
+            # Post the EXACT inverse of every original posting (sums to 0 -> ledger stays balanced).
+            inv = [(p["account_id"], round(-p["amount"], 2)) for p in entry["postings"]]
+            await ledger_post(f"Extourne — {orig.get('label','')}", "Extourne", inv, ref=rvid)
+            if cash:
+                await db.users.update_one({"user_id": orig["user_id"]}, {"$inc": {"balance_cc": round(-cash["amount"], 2)}})
+            await db.transactions.insert_one({
+                "tx_id": f"tx_{uuid.uuid4().hex[:10]}", "user_id": orig["user_id"],
+                "label": f"Extourne — {orig.get('label','')}", "amount": round(-cash["amount"], 2) if cash else 0.0,
+                "category": "Extourne", "type": "in" if cash and -cash["amount"] > 0 else "out", "ref": rvid,
+                "created_at": datetime.now(timezone.utc).isoformat()})
+            rec = {"reversal_id": rvid, "original_tx_id": req.original_tx_id, "user_id": orig["user_id"],
+                   "reason": req.reason, "status": "COMPLETED", "correlation_id": corr,
+                   "created_at": datetime.now(timezone.utc).isoformat()}
+            await db.reversals.insert_one(dict(rec))
+            await record_state("reversal", rvid, "REQUESTED", "COMPLETED", user["user_id"], req.reason, corr)
+            await audit(orig["user_id"], "Financial.ReversalCompleted",
+                        {"reversal_id": rvid, "original_tx_id": req.original_tx_id})
+            return await idem_finish(idem_id, rec)
+        except Exception:
+            # Compensation: clear the reversed flag so a retry is possible if posting failed.
+            await db.transactions.update_one({"tx_id": req.original_tx_id}, {"$set": {"reversed": False}})
+            raise
+    except Exception:
+        await idem_fail(idem_id)
+        raise
+
+@api_router.get("/reversals")
+async def list_reversals(user: dict = Depends(get_current_user)):
+    await require_admin(user)
+    return await db.reversals.find({}, {"_id": 0}).sort("created_at", -1).to_list(200)
 
 
 app.include_router(api_router)

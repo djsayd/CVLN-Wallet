@@ -177,7 +177,8 @@ class TestWithdrawalIdempotency:
                       json={"amount_cc": before + 50000, "iban": "FR7630006000011234567890189"},
                       headers=auth(token, {"Idempotency-Key": key}), timeout=30)
         assert r1.status_code == 400, r1.text[:300]
-        assert r1.json().get("detail") == "Solde insuffisant", r1.text[:300]
+        # B3 FIX #1: message now mentions available balance + fees
+        assert "insuffisant" in str(r1.json().get("detail", "")).lower(), r1.text[:300]
         assert mongo.idempotency_records.count_documents(
             {"idem_id": f"withdrawal:{plain_user['user_id']}:{key}"}) == 0
 

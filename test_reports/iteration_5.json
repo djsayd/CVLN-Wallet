@@ -1,0 +1,47 @@
+{
+  "summary": "Backend-only independent verification of P0.1-B3 (fees + refund + reversal engines) on the public REACT_APP_BACKEND_URL. Created 3 new pytest suites (39 new tests) plus re-ran all previous suites serially (-n 0). Core B3 behaviour is CORRECT, including TRUE concurrency: 24 concurrent partial refunds of 10 on a 100 principal -> exactly 10 x 200 + 14 x 409 in 3/3 rounds, refunded_cc == principal, never over-refunded; 16 concurrent reversals of one tx -> exactly 1 winner in 3/3 rounds; mixed 8 refunds + 8 reversals on the same tx -> refunds and reversals are mutually exclusive (never both). Ledger stayed balanced (financial-health ledger_balanced/jcc_supply_reconciled true, severity INFO, 0 cache_mismatches) after every batch. Fee policy CRUD/403, fee quote (2% -> 2CC, never negative, no charge), withdrawal fee debit (amount+fee, fee_cc, 'Frais' tx, 400 when insufficient), refund 404/400/403/409 guards, fully_refunded flag, reversal 409 guards (double-reverse, reverse-after-refund, refund-of-reversed), and Idempotency-Key replay (same key+payload -> same refund_id/reversal_id, no double credit; different payload -> 409) all pass. Regression: 69 previous tests pass (2 stale assertions in old test files updated by me: withdrawal insufficient-balance message now includes fees; refund/reversal/fees capabilities now REAL). 3 non-blocking defects found (2 xfail-marked, 1 pre-existing hold/withdrawal interaction). All seeded TEST users, refunds/reversals, ledger entries cleaned; fee_policy reset to {}.",
+  "backend_issues": {
+    "critical": [],
+    "minor": [
+      {"endpoint": "POST /api/withdrawals", "issue": "Available balance (balance_cc - held_cc) is NOT enforced: a user with balance 100 fully locked by an ACTIVE hold of 100 can still withdraw 100 (200 OK, balance -> 0, held_cc 100 stays). Holds guarantee is bypassed by the withdrawal path (apply_fee correctly uses available, the principal check does not). Also uses the request-time user snapshot instead of an atomic conditional $inc (concurrency probe showed no overdraft on 5x100/250, but the guard is not atomic).", "priority": "HIGH"},
+      {"endpoint": "POST /api/admin/withdrawals/{wd_id}/reject", "issue": "Reject credits back only amount_cc; the withdrawal fee (fee_cc, 2% = 2CC) stays debited, so a refused withdrawal costs the user the fee. No fee reversal / ledger revenue reversal (test xfail: balance 298 instead of 300)."},
+      {"endpoint": "POST /api/refunds", "issue": "Refunding an existing but non-refundable tx (Remboursement / Extourne) returns 404 TRANSACTION_NOT_FOUND instead of 400 ONLY_OUTFLOW_REFUNDABLE, because those txs' ledger entries carry ref=<refund_id>/<reversal_id> and _original_tx_and_entry looks up ref=tx_id. Misleading error code (test xfail)."},
+      {"endpoint": "POST /api/refunds, POST /api/reversals", "issue": "Guard-then-post ordering has no compensation: refunded_cc is $inc'ed (or reversed=true set) BEFORE ledger_post/balance credit. A crash between the two permanently consumes refundable principal / blocks reversal with no money moved (silent under-refund). idem_fail only clears the idempotency key, not the guard counter. Consider a PENDING refund record + compensating $inc on failure."},
+      {"endpoint": "POST /api/refunds", "issue": "_cash_and_counter assumes exactly 2 postings and takes the last non-cash posting as counterparty; a >2-posting original entry would be refunded against a single arbitrary counterparty leg (entry still balances, but attribution is wrong). Currently unreachable since all entries are 2-legged - add an explicit guard/validation."}
+    ]
+  },
+  "frontend_issues": {"ui_bugs": [], "integration_issues": [], "design_issues": []},
+  "test_report_links": [
+    "/app/backend/tests/test_p01b3_fees_refunds_reversals.py",
+    "/app/backend/tests/test_p01b3_stress_concurrency.py",
+    "/app/backend/tests/test_p01b3_withdrawal_guards.py",
+    "/app/test_reports/pytest/b3_results.xml",
+    "/app/test_reports/pytest/b3_regression.xml"
+  ],
+  "action_items": [
+    "Enforce available balance (balance_cc - held_cc) atomically in POST /api/withdrawals (single find_one_and_update with $expr on balance-held >= amount+fee) so holds cannot be bypassed / double-spent.",
+    "Refund the withdrawal fee (ledger revenue -> user cash) when an admin rejects a pending withdrawal.",
+    "Return 400 ONLY_OUTFLOW_REFUNDABLE (not 404) for existing non-refundable txs: resolve the original tx first, then the ledger entry.",
+    "Add a compensating decrement of refunded_cc / reversed flag when the post-guard ledger write fails (or write the refund record PENDING before posting)."
+  ],
+  "critical_code_review_comments": [
+    "server.py create_withdrawal: principal check reads the stale user snapshot and ignores held_cc -> holds are not honoured and the check is not atomic; move to a conditional find_one_and_update like apply_fee does.",
+    "server.py create_refund/create_reversal: the atomic guard mutates the original tx before value is moved; there is no rollback path on failure (report-only, no data corruption observed).",
+    "server.py is 1683 lines - split into routers/modules (financial core, holds, refunds/reversals, admin) per the 700-line guideline.",
+    "fee_policy is stored globally in settings with no per-operation whitelist; unknown operation keys are accepted silently by PUT /api/admin/fees (quote returns fee 0) - consider validating operation names and pct bounds (0..1)."
+  ],
+  "updated_files": [
+    "/app/backend/tests/test_p01b3_fees_refunds_reversals.py",
+    "/app/backend/tests/test_p01b3_stress_concurrency.py",
+    "/app/backend/tests/test_p01b3_withdrawal_guards.py",
+    "/app/backend/tests/backend_test.py",
+    "/app/backend/tests/test_p01b2_holds.py"
+  ],
+  "success_rate": {"backend": "100% of B3 assertions passed (29 B3 tests: 27 pass + 2 xfail findings; 7 stress concurrency pass; 69 regression pass after 2 stale-expectation test updates)", "frontend": "not tested (backend-only request)"},
+  "seed_data_creation": "Ephemeral TEST_ta_* users + sessions with balanced seed ledger entries (b3admin, b3user, b3poor, b3rej, b3sadm, b3suser, b3wh, b3wc, b3wadm), all deleted in fixture teardown. fee_policy set to {withdrawal:{pct:0.02}} during the fees module and reset to {} at the end (verified in Mongo).",
+  "should_call_test_agent_after_fix": true,
+  "should_main_agent_self_test": false,
+  "test_credentials": "Emergent Google auth; tests seed user+session in Mongo (Authorization: Bearer <session_token>) as documented in /app/memory/test_credentials.md",
+  "context_for_next_testing_agent": "B3 suites must run SERIALLY (-n 0) because admin integrity endpoints are global and fee_policy is global settings. New files: test_p01b3_fees_refunds_reversals.py (functional + idempotency + integrity, module-scoped fee policy fixture that resets to {}), test_p01b3_stress_concurrency.py (24-way refunds, 16-way reversals, mixed - ~90s), test_p01b3_withdrawal_guards.py (holds-vs-withdrawal xfail + concurrent withdrawal probe). Two xfails are intentional defect markers - if the dev agent fixes the fee-on-reject and the 404->400 issue, remove the pytest.xfail branches so they assert strictly. Old files backend_test.py / test_p01b2_holds.py were updated for B3 expectations (insufficient-balance message with fees; refund/reversal/fees capabilities REAL).",
+  "rca_of_the_issue": "Atomicity of refunds/reversals is sound: MongoDB single-document find_one_and_update with $expr (refunded_cc + amt <= principal, reversed != true) serialises all racing requests, verified with true thread-based fanout across 7 stress rounds (0 over-refunds, 0 double reversals, ledger per_asset_sum == 0 after every batch). The remaining holds bypass is in create_withdrawal, which validates req.amount_cc + fee against the request-time user.balance_cc snapshot without subtracting held_cc, so funds locked by an ACTIVE hold can be withdrawn; apply_fee's own $expr guard already uses balance-held, showing the correct pattern to replicate."
+}

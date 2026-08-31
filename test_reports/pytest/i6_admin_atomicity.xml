@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="utf-8"?><testsuites name="pytest tests"><testsuite name="pytest" errors="0" failures="1" skipped="0" tests="6" time="84.615" timestamp="2026-08-31T19:30:53.333173+00:00" hostname="agent-env-a0d29c1c-dc45-44b8-8dbf-aa6094a4aa09"><testcase classname="tests.test_p01b3_admin_decision_atomicity" name="test_concurrent_rejects_credit_only_once[1]" time="1.159" /><testcase classname="tests.test_p01b3_admin_decision_atomicity" name="test_concurrent_rejects_credit_only_once[2]" time="0.972" /><testcase classname="tests.test_p01b3_admin_decision_atomicity" name="test_concurrent_rejects_credit_only_once[3]" time="0.921" /><testcase classname="tests.test_p01b3_admin_decision_atomicity" name="test_concurrent_rejects_credit_only_once[4]" time="1.101"><failure message="AssertionError: reject is not atomic: 2 succeeded ([200, 404, 404, 404, 200, 404, 404, 404, 404, 404, 404, 404]), balance=402.0&#10;assert 2 == 1&#10; +  where 2 = &lt;built-in method count of list object at 0xfccb7799b9c0&gt;(200)&#10; +    where &lt;built-in method count of list object at 0xfccb7799b9c0&gt; = [200, 404, 404, 404, 200, 404, ...].count">api = &lt;requests.sessions.Session object at 0xfccb779ff150&gt;
+mongo = Database(MongoClient(host=['localhost:27017'], document_class=dict, tz_aware=False, connect=True), 'test_database')
+radmin = {'user_id': 'TEST_ta_b3radm_449305', 'token': 'TEST_tok_ee55fdbd5100'}
+rnd = 4
+
+    @pytest.mark.parametrize("rnd", [1, 2, 3, 4, 5])
+    def test_concurrent_rejects_credit_only_once(api, mongo, radmin, rnd):
+        uid, token = _mk_user(mongo, "b3rr", balance=300.0)
+        try:
+            wd = _mk_pending(api, token, 100)
+            assert abs(wallet_balance(api, token) - 198.0) &lt; 1e-6
+    
+            def call(_):
+                try:
+                    return requests.post(f"{BASE_URL}/api/admin/withdrawals/{wd['wd_id']}/reject",
+                                         headers=auth(radmin["token"]), timeout=60).status_code
+                except Exception:
+                    return 0
+    
+            with ThreadPoolExecutor(max_workers=12) as ex:
+                codes = list(ex.map(call, range(12)))
+            bal = wallet_balance(api, token)
+            print(f"round {rnd}: concurrent rejects codes={codes} balance={bal}")
+&gt;           assert codes.count(200) == 1, f"reject is not atomic: {codes.count(200)} succeeded ({codes}), balance={bal}"
+E           AssertionError: reject is not atomic: 2 succeeded ([200, 404, 404, 404, 200, 404, 404, 404, 404, 404, 404, 404]), balance=402.0
+E           assert 2 == 1
+E            +  where 2 = &lt;built-in method count of list object at 0xfccb7799b9c0&gt;(200)
+E            +    where &lt;built-in method count of list object at 0xfccb7799b9c0&gt; = [200, 404, 404, 404, 200, 404, ...].count
+
+tests/test_p01b3_admin_decision_atomicity.py:60: AssertionError</failure></testcase><testcase classname="tests.test_p01b3_admin_decision_atomicity" name="test_concurrent_rejects_credit_only_once[5]" time="79.833" /><testcase classname="tests.test_p01b3_admin_decision_atomicity" name="test_approve_and_reject_mutually_exclusive" time="0.592" /></testsuite></testsuites>

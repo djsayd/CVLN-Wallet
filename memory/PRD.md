@@ -69,3 +69,14 @@ Premium fintech wallet (Revolut/Qonto style) for CVLN Group cultural ecosystem. 
 - Docs: CVLN-FINANCIAL-STATE-MACHINES.md, CVLN-HOLDS-AUTHORIZATION-CAPTURE.md.
 - Vérifié testing_agent iteration_4: 68/69 + 32 tests holds (concurrence réelle: 10×20/100→max 5, 2×80→1 gagnant, idempotency-key concurrent→1 réservation, capture/release/expiry, race capture-vs-expiry, chaos load). 1 défaut trouvé (faux positif intégrité sur hold expiré non lu) → CORRIGÉ (reconcile avant check) et revérifié (32/32 pass).
 - Prochain: P0.1-B3 Refund/Reversal/Fees, puis B4 Settlement/Reconciliation+Outbox, puis B5 Decimal/minor-units + maker/checker.
+
+## Update 2026-06 — P0.1-B3 Fees + Refund + Reversal (REAL)
+- **Fees engine**: `settings.fee_policy {operation:{pct,flat}}`, ops validées (withdrawal/capture/marketplace/conversion/transfer/deposit, pct 0..1). `GET/PUT /api/admin/fees`, `POST /api/fees/quote`. Helper `apply_fee` (ledger user→revenue). Wiré sur `POST /api/withdrawals`.
+- **Withdrawal durci (fix HIGH)**: débit désormais ATOMIQUE `find_one_and_update` sur `users` (`$expr balance-held >= amount+fee`) → respecte les holds B2, race-safe, compensation si échec post-débit. `reject` rembourse principal ET frais.
+- **Admin decisions atomiques (fix CRITICAL TOCTOU)**: approve/reject font le flip `pending→processed/rejected` en `find_one_and_update` d'abord (verrou) → pas de double-crédit sous concurrence/retry.
+- **Refund engine**: `POST /api/refunds` (admin, idempotent). Garde cumulée ATOMIQUE sur la tx originale (`refunded_cc + amt <= principal`, `reversed!=true`), partiels multiples, over-refund→409, 404 seulement si tx absente, 400 si inflow, compensation si échec.
+- **Reversal engine**: `POST /api/reversals` (admin, idempotent). Garde single-winner (`reversed=true` si `refunded_cc==0`), inverse exact des postings (ledger équilibré), exclusion mutuelle refund/reversal, compensation.
+- `/api/system/status`: fees_engine/refund_engine/reversal_engine → REAL. settlement PARTIAL, outbox PLANNED, stripe SANDBOX, card MOCK (inchangés).
+- Doc: CVLN-REFUND-REVERSAL-FEES.md.
+- Vérifié testing_agent iterations 5+6: 129 tests verts + concurrence réelle (12×25 retraits→exactement 4 gagnants, refunds 24-way jamais over-refund, reversals 16-way un seul gagnant, reject 12-way un seul crédit). 5 défauts iteration_5 corrigés + 1 CRITICAL TOCTOU reject trouvé iteration_6 et corrigé (vérifié curl: balance 300 pas 400).
+- Prochain: **P0.1-B4** Settlement + Reconciliation + Transactional Outbox, puis B5 Decimal/minor-units + Maker/Checker + Recovery.

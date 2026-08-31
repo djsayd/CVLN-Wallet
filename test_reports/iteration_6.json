@@ -1,0 +1,51 @@
+{
+  "summary": "Backend-only RE-TEST of P0.1-B3 after the 5 fixes from iteration_5. All 4 previously-reported defects are CONFIRMED FIXED and the 3 xfail markers were removed and replaced with STRICT regression assertions. FIX #1 (atomic available-balance on POST /api/withdrawals): balance 100 fully locked by an ACTIVE hold of 100 -> withdraw 100 = 400 'Solde disponible insuffisant', balance stays 100 / held stays 100 / no withdrawal doc; releasing the hold then allows the withdrawal (balance -> 0); partial hold (100 bal / 60 held) -> 50 rejected, 40 accepted; TRUE concurrency 12x25 on a 100 balance -> EXACTLY 4 winners in 3/3 rounds (balance 0, 4 withdrawal docs); 8x25 with a 50 hold -> exactly 2 winners (balance 50, held 50). FIX #2 (reject refunds principal + fee): 300->withdraw 100 (fee 2) ->198, reject -> 300 with a 'Frais retrait remboursés' inflow tx; exact PRD scenario 100 -> withdraw 50 (fee 1) -> 49, reject -> 100. FIX #3: refund of an existing inflow (Retrait refusé / Remboursement / Extourne) -> 400 ONLY_OUTFLOW_REFUNDABLE, 404 only for a non-existent tx_id. FIX #4: no guard drift observable — refunded_cc == SUM(refunds records) after partial + rejected + 20-way concurrent refunds, reversed flag <=> reversals record, DB-wide drift detector clean. FIX #5: PUT /api/admin/fees rejects unknown ops and pct>1 / pct<0 / flat<0 with 400 and leaves the stored policy untouched; all 6 valid ops accepted. B3/B2 regression: 129 tests green serially (fees quote, withdrawal fee debit, refund partial/full + cumulative 409, 24-way concurrent refunds never over-refund, 16-way reversals exactly one winner, refund/reversal mutual exclusion, Idempotency-Key replay, holds create/capture/release/expiry, available_balance in GET /api/wallet, kill-switch, backfill drift). Ledger stayed balanced (ledger_balanced + jcc_supply_reconciled true, severity INFO) after every batch. ONE NEW HIGH defect found: POST /api/admin/withdrawals/{id}/reject is NOT atomic — concurrent rejects can both succeed and credit principal+fee TWICE (balance 402 instead of 300, reproduced in 2/9 rounds at 8-12 way concurrency).",
+  "backend_issues": {
+    "critical": [
+      {"endpoint": "POST /api/admin/withdrawals/{wd_id}/reject", "issue": "NOT ATOMIC (TOCTOU): the handler reads the withdrawal, checks status=='pending', performs the principal credit + fee credit + ledger postings, and only sets status='rejected' at the END. Two concurrent rejects both pass the check -> user is credited TWICE (reproduced: 12 concurrent rejects, codes contained two 200s, balance 402 instead of 300 = +102 CC created; 2 of 9 rounds ~22% under 8-12 way concurrency). Same read-then-write pattern in /approve, so an approve+reject race can in principle both pass (not reproduced: 3/3 rounds had exactly 1 winner). FIX: flip the status FIRST with a conditional find_one_and_update({wd_id, status:'pending'}, {$set:{status:'rejected'|'processed'}}) and only post value when a document was actually matched (with compensation on post-flip failure), exactly like the withdrawal/refund/reversal guards.", "priority": "HIGH"}
+    ],
+    "minor": [
+      {"endpoint": "GET /api/admin/financial-health", "issue": "The double-reject duplication is INVISIBLE to the integrity checks: both credit paths post balanced 2-leg entries and update balance_cc, so ledger_balanced/jcc_supply_reconciled stay true and severity stays INFO while 102 CC were created from the Retrait counter account. Consider an invariant 'sum of credits referencing a withdrawal <= amount_cc + fee_cc' / one-decision-per-withdrawal check."},
+      {"endpoint": "POST /api/refunds", "issue": "Pre-existing (unchanged): _cash_and_counter assumes exactly 2 postings and takes the last non-cash posting as counterparty. Now guarded by the len(postings)!=2 -> 400 LEDGER_ENTRY_UNSUPPORTED check, so it is safe, but multi-leg entries are simply un-refundable."},
+      {"endpoint": "POST /api/admin/withdrawals/{wd_id}/reject", "issue": "No Idempotency-Key support on admin decision endpoints, so a client retry after a timeout can double-credit even without true concurrency."}
+    ]
+  },
+  "frontend_issues": {"ui_bugs": [], "integration_issues": [], "design_issues": []},
+  "test_report_links": [
+    "/app/backend/tests/test_p01b3_withdrawal_guards.py",
+    "/app/backend/tests/test_p01b3_fees_refunds_reversals.py",
+    "/app/backend/tests/test_p01b3_fix4_compensation.py",
+    "/app/backend/tests/test_p01b3_admin_decision_atomicity.py",
+    "/app/test_reports/pytest/i6_b3_rerun.xml",
+    "/app/test_reports/pytest/i6_fix4.xml",
+    "/app/test_reports/pytest/i6_admin_atomicity.xml",
+    "/app/test_reports/pytest/i6_full.xml"
+  ],
+  "action_items": [
+    "Make POST /api/admin/withdrawals/{wd_id}/reject (and /approve) atomic: conditional find_one_and_update on status=='pending' BEFORE any credit/ledger posting, compensate (status back to pending) if the posting fails. Currently a concurrent/retried reject double-credits principal + fee (+102 CC in the reproduced run).",
+    "Optionally add Idempotency-Key handling to the admin approve/reject endpoints.",
+    "Consider a financial-health invariant that detects more than one decision credit per withdrawal (the current checks cannot see this duplication).",
+    "Split server.py (1740 lines) into routers per the 700-line guideline (still outstanding from iteration_5)."
+  ],
+  "critical_code_review_comments": [
+    "server.py admin_reject_wd/admin_approve_wd are the only remaining money-moving handlers that use a read-then-check-then-write pattern instead of a single-document conditional update — this is the exact class of bug that was just fixed in create_withdrawal/create_refund/create_reversal.",
+    "create_withdrawal now correctly uses one find_one_and_update with $expr on (balance_cc - held_cc) >= amount+fee plus compensation on post-debit failure — verified atomic under 12-way concurrency.",
+    "create_refund/create_reversal resolve the original tx before the ledger entry (correct 404 vs 400 semantics) and compensate refunded_cc / reversed on post-guard failure; the 2-posting precondition is now explicit (400 LEDGER_ENTRY_UNSUPPORTED).",
+    "admin_set_fees whitelist + bounds are enforced before the write, so a rejected policy leaves the stored policy intact (verified)."
+  ],
+  "updated_files": [
+    "/app/backend/tests/test_p01b3_withdrawal_guards.py",
+    "/app/backend/tests/test_p01b3_fees_refunds_reversals.py",
+    "/app/backend/tests/backend_test.py",
+    "/app/backend/tests/test_p01b3_fix4_compensation.py",
+    "/app/backend/tests/test_p01b3_admin_decision_atomicity.py",
+    "/app/backend/tests/_cleanup_check.py"
+  ],
+  "success_rate": {"backend": "129/130 assertions green (all 5 fixes verified strictly, 3 xfails removed); 1 NEW failing test: concurrent admin reject double-credit (~22% reproduction rate)", "frontend": "not tested (backend-only request)"},
+  "seed_data_creation": "Ephemeral TEST_ta_* users + sessions with balanced seed ledger entries (b3admin, b3user, b3poor, b3rej, b3rej2, b3wadm, b3wh, b3wph, b3wc, b3wch, b3cadm, b3cusr, b3radm, b3rr, b3ar) — all deleted in fixture teardown. Verified after the run: 0 TEST users/sessions/txs/withdrawals/holds/refunds/reversals/ledger entries remain and fee_policy is reset to {}.",
+  "should_call_test_agent_after_fix": true,
+  "should_main_agent_self_test": false,
+  "test_credentials": "Emergent Google auth; tests seed user+session in Mongo (Authorization: Bearer <session_token>) per /app/memory/test_credentials.md",
+  "context_for_next_testing_agent": "Run B3/B2 suites SERIALLY (-n 0) — fee_policy and admin integrity endpoints are global. New/updated files: test_p01b3_withdrawal_guards.py (rewritten: strict holds enforcement + 3 rounds of 12-way concurrent withdrawals + hold+concurrency, fee policy forced to {} in this module), test_p01b3_fix4_compensation.py (guard-vs-record invariants + DB-wide refund drift detector), test_p01b3_admin_decision_atomicity.py (NEW — 5 rounds of 12 concurrent rejects; this is the only currently FAILING suite, it exposes the double-credit race; keep it, do not weaken the assertion), test_p01b3_fees_refunds_reversals.py (xfails removed, FIX #5 fee-policy validation tests added, Extourne-refund test now self-contained). backend_test.py withdrawal insufficient-message assertion loosened to 'insuffisant'. All xfail markers are gone from the repo. /app/backend/tests/_cleanup_check.py prints leftover TEST data + fee_policy — run it after every session.",
+  "rca_of_the_issue": "admin_reject_wd: `wd = find_one({wd_id}); if not wd or wd['status'] != 'pending': 404` then add_transaction(principal), fee ledger_post + $inc balance, and finally update_one({wd_id}, {$set:{status:'rejected'}}). Between the read and the final $set there is no lock, so N concurrent requests all observe status=='pending' and all execute the credit block; each posts its own balanced ledger pair, so the ledger invariants remain satisfied while the user's balance is inflated by k*(amount_cc+fee_cc). Reproduced deterministically enough (2/9 rounds at 8-12 concurrent calls, balance 402 vs expected 300). Mitigation: move the status transition to a conditional single-document find_one_and_update executed BEFORE any value movement, and compensate the status back to 'pending' if the subsequent postings raise."
+}
