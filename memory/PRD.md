@@ -34,3 +34,11 @@ Premium fintech wallet (Revolut/Qonto style) for CVLN Group cultural ecosystem. 
 - Endpoints ajoutés: GET /admin/skills, GET /admin/intents, POST /agent/intent/{id}/decline.
 - E2E navigateur OK: create->simulate->preview->confirm->execute; solde 1000->950; audit 4 events.
 - Nav admin-only: API, Agents, Admin (masqué pour users + require_admin backend).
+
+## Update 2026-06 — Virtual Card + Mobile Wallet abstraction (P1)
+- Modèle Card REAL (freeze/limits/online-tpe-agent toggles), PAN/CVV jamais generes (issuing MOCK).
+- Card Skills: Card.View/Freeze/SetLimits/Pay dans lAgent Factory; Card.Pay via flow intent (policy carte inter agent inter solde).
+- Page /Carte (nav Carte): visuel masque, freeze, plafonds, depenses du jour, historique carte+agent.
+- Mobile Wallet Apple/Google = PLANNED (eligibility + provision 501, aucune fausse activation).
+- Docs: CVLN-VIRTUAL-CARD-AUDIT/SKILLS/SECURITY.md + CVLN-MOBILE-WALLET.md.
+- Tests curl 10/10 OK: seed, eligibility PLANNED, provision 501, plafond carte, confirm+capture 150, freeze bloque, solde 1000->850.

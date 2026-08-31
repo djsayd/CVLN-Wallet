@@ -123,6 +123,25 @@ async def seed_user_data(user_id: str):
         await db.coffres.insert_many(coffres)
 
 
+async def get_or_seed_card(user_id: str) -> dict:
+    c = await db.cards.find_one({"user_id": user_id}, {"_id": 0})
+    if not c:
+        c = {"card_id": f"card_{uuid.uuid4().hex[:10]}", "user_id": user_id, "brand": "CVLN Virtual",
+             "last4": f"{random.randint(0,9999):04d}", "exp_month": random.randint(1, 12), "exp_year": 2030,
+             "status": "active", "daily_limit_cc": 500.0, "per_tx_limit_cc": 200.0,
+             "online_enabled": True, "tpe_enabled": True, "agent_enabled": True,
+             "issuing_status": "MOCK", "created_at": datetime.now(timezone.utc).isoformat()}
+        await db.cards.insert_one(dict(c))
+    return c
+
+async def _today_card_spent(user_id: str) -> float:
+    today = datetime.now(timezone.utc).date().isoformat()
+    spent = 0.0
+    async for t in db.transactions.find({"user_id": user_id, "category": "Card"}, {"amount": 1, "created_at": 1}):
+        if str(t.get("created_at", ""))[:10] == today and t["amount"] < 0:
+            spent += -t["amount"]
+    return spent
+
 async def add_transaction(user_id: str, label: str, amount: float, category: str):
     doc = {
         "tx_id": f"tx_{uuid.uuid4().hex[:10]}",
@@ -173,6 +192,7 @@ async def create_session(request: Request, response: Response):
             "created_at": datetime.now(timezone.utc).isoformat(),
         })
         await seed_user_data(user_id)
+        await get_or_seed_card(user_id)
     session_token = data["session_token"]
     expires_at = datetime.now(timezone.utc) + timedelta(days=7)
     await db.user_sessions.update_one(
@@ -634,6 +654,12 @@ SKILLS = {
     "KORA.StreamIncome":{"capability": "prepare_income",  "scopes": ["request"],                  "risk": "MED",  "confirm": True,  "networks": ["JCC"], "desc": "Interface KORA (préparée) : préparer un versement de revenus créateur."},
 }
 SCOPE_ORDER = ["read", "request", "sign", "execute", "admin"]
+SKILLS.update({
+    "Card.View":      {"capability": "card_view",   "scopes": ["read"],                       "risk": "LOW",  "confirm": False, "networks": ["JCC"], "desc": "Consulter la carte (données masquées, jamais PAN/CVV)."},
+    "Card.Freeze":    {"capability": "card_freeze",  "scopes": ["request"],                    "risk": "MED",  "confirm": True,  "networks": ["JCC"], "desc": "Geler la carte (bloque les paiements)."},
+    "Card.SetLimits": {"capability": "card_limits",  "scopes": ["admin"],                      "risk": "HIGH", "confirm": True,  "networks": ["JCC"], "desc": "Modifier les plafonds de la carte."},
+    "Card.Pay":       {"capability": "card_pay",     "scopes": ["request", "sign", "execute"], "risk": "HIGH", "confirm": True,  "networks": ["JCC"], "desc": "Paiement carte (online/merchant/TPE). Déplace des fonds."},
+})
 
 class AgentCreate(BaseModel):
     name: str
@@ -753,6 +779,28 @@ async def create_intent(req: IntentCreate, agent: dict = Depends(get_agent)):
         if amount > owner.get("balance_cc", 0):
             raise HTTPException(status_code=400, detail="Solde insuffisant")
         preview.update({"from": owner.get("frek_id"), "to": to, "amount_cc": amount})
+    elif skill["capability"] == "card_pay":
+        card = await db.cards.find_one({"user_id": agent["owner_user_id"]}, {"_id": 0})
+        amount = float(req.params.get("amount_cc", 0)); merchant = req.params.get("merchant", "Marchand")
+        ptype = req.params.get("payment_type", "online")
+        if not card:
+            raise HTTPException(status_code=400, detail="Aucune carte")
+        if card["status"] != "active":
+            await audit(agent["agent_id"], "intent_denied", {"reason": "card_frozen"})
+            raise HTTPException(status_code=403, detail="Carte gelée → paiement refusé")
+        if not card.get("agent_enabled", True):
+            raise HTTPException(status_code=403, detail="Paiements agent désactivés sur la carte")
+        if amount <= 0:
+            raise HTTPException(status_code=400, detail="Montant invalide")
+        if amount > agent.get("spending_limit_cc", 0):
+            await audit(agent["agent_id"], "intent_denied", {"reason": "agent_limit", "amount": amount})
+            raise HTTPException(status_code=403, detail=f"Plafond agent dépassé ({agent.get('spending_limit_cc',0)} CC)")
+        if amount > card.get("per_tx_limit_cc", 0):
+            await audit(agent["agent_id"], "intent_denied", {"reason": "card_per_tx_limit"})
+            raise HTTPException(status_code=403, detail=f"Plafond carte/transaction dépassé ({card.get('per_tx_limit_cc',0)} CC)")
+        if amount > owner.get("balance_cc", 0):
+            raise HTTPException(status_code=400, detail="Solde insuffisant")
+        preview.update({"card_last4": card["last4"], "merchant": merchant, "amount_cc": amount, "payment_type": ptype})
     status = "awaiting_confirmation" if skill["confirm"] else "prepared"
     doc = {"intent_id": f"int_{uuid.uuid4().hex[:10]}", "agent_id": agent["agent_id"], "owner_user_id": agent["owner_user_id"],
            "skill": req.skill, "params": req.params, "risk": skill["risk"], "confirm_required": skill["confirm"],
@@ -784,10 +832,24 @@ async def execute_intent(intent_id: str, agent: dict = Depends(get_agent)):
         await audit(agent["agent_id"], "execute_denied", {"intent_id": intent_id, "reason": "not_confirmed"})
         raise HTTPException(status_code=403, detail="Confirmation utilisateur requise avant exécution")
     skill = SKILLS[intent["skill"]]
-    if not has_scopes(agent, ["execute"]) and skill["capability"] == "send_asset":
+    if not has_scopes(agent, ["execute"]) and skill["capability"] in ("send_asset", "card_pay"):
         raise HTTPException(status_code=403, detail="Scope 'execute' requis")
     result = {"executed": True}
-    if skill["capability"] == "send_asset":
+    if skill["capability"] == "card_pay":
+        p = intent["preview"]
+        card = await db.cards.find_one({"user_id": intent["owner_user_id"]}, {"_id": 0})
+        owner = await db.users.find_one({"user_id": intent["owner_user_id"]}, {"_id": 0})
+        if not card or card["status"] != "active":
+            raise HTTPException(status_code=403, detail="Carte gelée → paiement refusé")
+        if p["amount_cc"] > owner.get("balance_cc", 0):
+            raise HTTPException(status_code=400, detail="Solde insuffisant")
+        await add_transaction(intent["owner_user_id"], f"Carte •••• {p['card_last4']} — {p['merchant']} ({p['payment_type']})", -p["amount_cc"], "Card")
+        await audit(agent["agent_id"], "Card.PaymentCaptured", {"intent_id": intent_id, "amount": p["amount_cc"], "merchant": p["merchant"]})
+        result["amount_cc"] = p["amount_cc"]
+    elif skill["capability"] == "card_freeze":
+        await db.cards.update_one({"user_id": intent["owner_user_id"]}, {"$set": {"status": "frozen"}})
+        await audit(agent["agent_id"], "Card.Frozen", {"intent_id": intent_id})
+    elif skill["capability"] == "send_asset":
         p = intent["preview"]
         owner = await db.users.find_one({"user_id": intent["owner_user_id"]}, {"_id": 0})
         if p["amount_cc"] > owner.get("balance_cc", 0):
@@ -800,6 +862,69 @@ async def execute_intent(intent_id: str, agent: dict = Depends(get_agent)):
     await db.agent_intents.update_one({"intent_id": intent_id}, {"$set": {"status": "executed"}})
     await audit(agent["agent_id"], "intent_executed", {"intent_id": intent_id, "result": result})
     return {"ok": True, "result": result}
+
+
+# ================= CVLN VIRTUAL CARD (issuing = MOCK, ledger = REAL on CC) =================
+# NOTE: No real card issuer/processor connected. PAN/CVV are NEVER generated or stored.
+# Only a masked last4 is kept. Mobile wallet provisioning = PLANNED (needs issuer).
+class CardLimits(BaseModel):
+    daily_limit_cc: Optional[float] = None
+    per_tx_limit_cc: Optional[float] = None
+    online_enabled: Optional[bool] = None
+    tpe_enabled: Optional[bool] = None
+    agent_enabled: Optional[bool] = None
+
+@api_router.get("/card")
+async def get_card(user: dict = Depends(get_current_user)):
+    c = await get_or_seed_card(user["user_id"])
+    return {**c, "today_spent_cc": await _today_card_spent(user["user_id"])}
+
+@api_router.post("/card/freeze")
+async def card_freeze(user: dict = Depends(get_current_user)):
+    await get_or_seed_card(user["user_id"])
+    await db.cards.update_one({"user_id": user["user_id"]}, {"$set": {"status": "frozen"}})
+    await audit(user["user_id"], "Card.Frozen", {})
+    return {"ok": True, "status": "frozen"}
+
+@api_router.post("/card/unfreeze")
+async def card_unfreeze(user: dict = Depends(get_current_user)):
+    await get_or_seed_card(user["user_id"])
+    await db.cards.update_one({"user_id": user["user_id"]}, {"$set": {"status": "active"}})
+    await audit(user["user_id"], "Card.Unfrozen", {})
+    return {"ok": True, "status": "active"}
+
+@api_router.put("/card/limits")
+async def card_limits(req: CardLimits, user: dict = Depends(get_current_user)):
+    await get_or_seed_card(user["user_id"])
+    upd = {k: v for k, v in req.dict().items() if v is not None}
+    if upd:
+        await db.cards.update_one({"user_id": user["user_id"]}, {"$set": upd})
+        await audit(user["user_id"], "Card.LimitChanged", upd)
+    return await db.cards.find_one({"user_id": user["user_id"]}, {"_id": 0})
+
+@api_router.get("/card/transactions")
+async def card_transactions(user: dict = Depends(get_current_user)):
+    return await db.transactions.find({"user_id": user["user_id"], "category": {"$in": ["Card", "Agent"]}}, {"_id": 0}).sort("created_at", -1).to_list(100)
+
+@api_router.post("/card/pay")
+async def card_pay(user: dict = Depends(get_current_user)):
+    # Human-initiated card payment (demo). Amount/merchant via body.
+    raise HTTPException(status_code=400, detail="Utilisez la Marketplace ou un paiement agent (Card.Pay).")
+
+# ---- Mobile Wallet provisioning (Apple/Google) — PLANNED, no real issuer ----
+@api_router.get("/card/wallet-eligibility")
+async def wallet_eligibility(user: dict = Depends(get_current_user)):
+    await audit(user["user_id"], "MobileWallet.EligibilityChecked", {})
+    reason = "Card issuing non connecté à un issuer/processor certifié (Apple/Google provisioning requiert un partenaire émetteur)."
+    return {
+        "apple": {"status": "PLANNED", "eligible": False, "reason": reason},
+        "google": {"status": "PLANNED", "eligible": False, "reason": reason},
+    }
+
+@api_router.post("/card/wallet/{platform}/provision")
+async def wallet_provision(platform: str, user: dict = Depends(get_current_user)):
+    await audit(user["user_id"], "MobileWallet.ProvisioningFailed", {"platform": platform, "reason": "no_issuer"})
+    raise HTTPException(status_code=501, detail=f"Provisioning {platform} indisponible (statut PLANNED : issuer/processor requis).")
 
 
 app.include_router(api_router)

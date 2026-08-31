@@ -14,6 +14,7 @@ import Convertir from "@/pages/Convertir";
 import Marketplace from "@/pages/Marketplace";
 import Ecosysteme from "@/pages/Ecosysteme";
 import FrekId from "@/pages/FrekId";
+import Card from "@/pages/Card";
 import Developers from "@/pages/Developers";
 import Admin from "@/pages/Admin";
 import Agents from "@/pages/Agents";
@@ -80,6 +81,7 @@ function AppRouter() {
       >
         <Route path="/" element={<Dashboard />} />
         <Route path="/wallet" element={<Wallet />} />
+        <Route path="/card" element={<Card />} />
         <Route path="/transactions" element={<Transactions />} />
         <Route path="/coffres" element={<Coffres />} />
         <Route path="/convertir" element={<Convertir />} />
@@ -107,6 +109,7 @@ export default function App() {
     </BrowserRouter>
   );
 }
+
 
 
 

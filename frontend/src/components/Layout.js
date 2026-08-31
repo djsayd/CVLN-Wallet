@@ -3,13 +3,14 @@ import { useState } from "react";
 import { motion } from "framer-motion";
 import {
   House, Wallet as WalletIcon, Receipt, Vault, ArrowsLeftRight,
-  Storefront, Planet, IdentificationCard, Gear, SignOut, List, X, MagnifyingGlass, Code, ShieldStar, Robot,
+  Storefront, Planet, IdentificationCard, Gear, SignOut, List, X, MagnifyingGlass, Code, ShieldStar, Robot, CreditCard,
 } from "@phosphor-icons/react";
 import { useAuth } from "@/context/AuthContext";
 
 const NAV = [
   { to: "/", label: "Dashboard", icon: House },
   { to: "/wallet", label: "Wallet", icon: WalletIcon },
+  { to: "/card", label: "Carte", icon: CreditCard },
   { to: "/transactions", label: "Transactions", icon: Receipt },
   { to: "/coffres", label: "Coffres", icon: Vault },
   { to: "/convertir", label: "Convertir", icon: ArrowsLeftRight },
