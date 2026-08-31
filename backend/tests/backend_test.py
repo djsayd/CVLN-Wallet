@@ -87,7 +87,7 @@ class TestSendIdempotency:
         r1 = api.post(f"{BASE_URL}/api/actions/send", json=bad,
                       headers=auth(token, {"Idempotency-Key": key}), timeout=30)
         assert r1.status_code == 400, r1.text[:300]
-        assert r1.json().get("detail") == "Solde insuffisant", r1.text[:300]
+        assert r1.json().get("detail") in ("Solde insuffisant", "Solde disponible insuffisant"), r1.text[:300]
         r2 = api.post(f"{BASE_URL}/api/actions/send", json=bad,
                       headers=auth(token, {"Idempotency-Key": key}), timeout=30)
         assert r2.status_code == 400, (
@@ -104,7 +104,7 @@ class TestSendIdempotency:
         r1 = api.post(f"{BASE_URL}/api/actions/send", json=bad,
                       headers=auth(token, {"Idempotency-Key": key}), timeout=30)
         assert r1.status_code == 400, r1.text[:300]
-        assert r1.json().get("detail") == "Solde insuffisant", r1.text[:300]
+        assert r1.json().get("detail") in ("Solde insuffisant", "Solde disponible insuffisant"), r1.text[:300]
         # PROCESSING record must be gone
         assert mongo.idempotency_records.count_documents(
             {"idem_id": f"send:{plain_user['user_id']}:{key}"}) == 0, \

@@ -496,7 +496,7 @@ class TestIntegrityAndStatus:
         assert caps["reversal_engine"] == "REAL"
         assert caps["fees_engine"] == "REAL"
         assert caps["settlement_engine"] == "PARTIAL"
-        assert caps["outbox_events"] == "PLANNED"
+        assert caps["outbox_events"] == "PARTIAL"
         assert caps["payments_deposit_stripe"] == "SANDBOX"
         assert caps["card_issuing"] == "MOCK"
 

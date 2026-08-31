@@ -11,6 +11,7 @@ from typing import List, Optional
 import uuid
 import random
 import httpx
+import asyncio
 from datetime import datetime, timezone, timedelta
 
 ROOT_DIR = Path(__file__).parent
@@ -239,7 +240,7 @@ async def _today_card_spent(user_id: str) -> float:
             spent += -t["amount"]
     return spent
 
-async def add_transaction(user_id: str, label: str, amount: float, category: str, idempotency_key: str = None):
+async def add_transaction(user_id: str, label: str, amount: float, category: str, idempotency_key: str = None, skip_balance: bool = False):
     doc = {
         "tx_id": f"tx_{uuid.uuid4().hex[:10]}",
         "user_id": user_id,
@@ -255,9 +256,21 @@ async def add_transaction(user_id: str, label: str, amount: float, category: str
         await ledger_post(label, category,
                           [(cash_acct(user_id), amount), (_counter_account(category), -amount)],
                           ref=doc["tx_id"], idempotency_key=idempotency_key)
-        await db.users.update_one({"user_id": user_id}, {"$inc": {"balance_cc": amount}})
+        # skip_balance=True when the caller already debited atomically via atomic_spend().
+        if not skip_balance:
+            await db.users.update_one({"user_id": user_id}, {"$inc": {"balance_cc": amount}})
     doc.pop("_id", None)
     return doc
+
+async def atomic_spend(user_id: str, amount: float) -> bool:
+    """Atomically debit AVAILABLE funds (balance_cc - held_cc) in ONE conditional update.
+    Returns False if available is insufficient. Hold-aware + race-safe (no read-then-write).
+    Every spend path uses this so no module can bypass the B2 available-balance invariant."""
+    res = await db.users.find_one_and_update(
+        {"user_id": user_id,
+         "$expr": {"$gte": [{"$subtract": ["$balance_cc", {"$ifNull": ["$held_cc", 0]}]}, amount]}},
+        {"$inc": {"balance_cc": -amount}}, return_document=ReturnDocument.AFTER)
+    return res is not None
 
 
 # ---------------- Auth routes ----------------
@@ -366,10 +379,10 @@ async def send_money(req: SendRequest, request: Request, user: dict = Depends(ge
     try:
         if req.amount <= 0:
             raise HTTPException(status_code=400, detail="Montant invalide")
-        if req.amount > user.get("balance_cc", 0):
-            raise HTTPException(status_code=400, detail="Solde insuffisant")
+        if not await atomic_spend(user["user_id"], req.amount):
+            raise HTTPException(status_code=400, detail="Solde disponible insuffisant")
         label = f"Envoi à {req.recipient}" + (f" — {req.note}" if req.note else "")
-        tx = await add_transaction(user["user_id"], label, -req.amount, "Transfert")
+        tx = await add_transaction(user["user_id"], label, -req.amount, "Transfert", skip_balance=True)
         return await idem_finish(idem_id, {"ok": True, "transaction": tx})
     except Exception:
         await idem_fail(idem_id)
@@ -418,12 +431,16 @@ async def move_coffre(coffre_id: str, req: CoffreMove, request: Request, user: d
         coffre = await db.coffres.find_one({"coffre_id": coffre_id, "user_id": user["user_id"]}, {"_id": 0})
         if not coffre:
             raise HTTPException(status_code=404, detail="Coffre introuvable")
-        if req.amount > 0 and req.amount > user.get("balance_cc", 0):
-            raise HTTPException(status_code=400, detail="Solde insuffisant")
         if req.amount < 0 and -req.amount > coffre.get("amount_cc", 0):
             raise HTTPException(status_code=400, detail="Fonds insuffisants dans le coffre")
+        if req.amount > 0:
+            # Moving cash INTO the coffre spends available funds -> atomic + hold-aware.
+            if not await atomic_spend(user["user_id"], req.amount):
+                raise HTTPException(status_code=400, detail="Solde disponible insuffisant")
+        elif req.amount < 0:
+            # Moving cash OUT of the coffre back to available balance (credit).
+            await db.users.update_one({"user_id": user["user_id"]}, {"$inc": {"balance_cc": -req.amount}})
         await db.coffres.update_one({"coffre_id": coffre_id}, {"$inc": {"amount_cc": req.amount}})
-        await db.users.update_one({"user_id": user["user_id"]}, {"$inc": {"balance_cc": -req.amount}})
         verb = "Dépôt vers" if req.amount > 0 else "Retrait de"
         await ledger_post(f"{verb} {coffre['name']}", "Coffre",
                           [(cash_acct(user["user_id"]), -req.amount), (coffre_acct(coffre_id), req.amount)])
@@ -474,9 +491,9 @@ async def buy_marketplace(req: MarketplaceBuy, request: Request, user: dict = De
         item = next((i for i in MARKETPLACE_ITEMS if i["item_id"] == req.item_id), None)
         if not item:
             raise HTTPException(status_code=404, detail="Article introuvable")
-        if item["price_cc"] > user.get("balance_cc", 0):
-            raise HTTPException(status_code=400, detail="Solde insuffisant")
-        tx = await add_transaction(user["user_id"], f"Achat — {item['title']}", -item["price_cc"], "Marketplace")
+        if item["price_cc"] > 0 and not await atomic_spend(user["user_id"], item["price_cc"]):
+            raise HTTPException(status_code=400, detail="Solde disponible insuffisant")
+        tx = await add_transaction(user["user_id"], f"Achat — {item['title']}", -item["price_cc"], "Marketplace", skip_balance=True)
         return await idem_finish(idem_id, {"ok": True, "transaction": tx})
     except Exception:
         await idem_fail(idem_id)
@@ -579,9 +596,10 @@ async def v1_charge(req: EntityCharge, ent: dict = Depends(get_entity)):
     user = await db.users.find_one({"frek_id": req.frek_id}, {"_id": 0})
     if not user:
         raise HTTPException(status_code=404, detail="FREK-ID introuvable")
-    if req.amount > user.get("balance_cc", 0):
-        raise HTTPException(status_code=400, detail="Solde utilisateur insuffisant")
-    await add_transaction(user["user_id"], f"Paiement {ent['name']}" + (f" — {req.note}" if req.note else ""), -req.amount, ent["name"])
+    # Charge real user funds -> atomic + hold-aware (no read-then-write bypass).
+    if not await atomic_spend(user["user_id"], req.amount):
+        raise HTTPException(status_code=400, detail="Solde disponible utilisateur insuffisant")
+    await add_transaction(user["user_id"], f"Paiement {ent['name']}" + (f" — {req.note}" if req.note else ""), -req.amount, ent["name"], skip_balance=True)
     await db.entities.update_one({"entity_id": ent["entity_id"]}, {"$inc": {"balance_cc": req.amount}})
     await log_entity_tx(ent["entity_id"], f"Encaissement {req.frek_id}", req.amount, req.frek_id)
     return {"ok": True, "frek_id": req.frek_id, "amount": req.amount}
@@ -610,6 +628,21 @@ async def seed_entities():
         await db.balance_holds.create_index("hold_id", unique=True)
         await db.balance_holds.create_index([("user_id", 1), ("status", 1)])
         await db.financial_state_history.create_index([("entity_type", 1), ("entity_id", 1)])
+        await db.outbox_events.create_index("event_id", unique=True)
+        await db.outbox_events.create_index([("status", 1), ("available_at", 1)])
+        await db.outbox_consumed.create_index("event_id", unique=True)
+        await db.webhook_inbox.create_index([("provider", 1), ("provider_event_id", 1)], unique=True)
+        await db.settlements.create_index("settlement_id", unique=True)
+        await db.settlements.create_index("idempotency_key", unique=True)
+        await db.settlements.create_index("provider_reference")
+        await db.reconciliation_cases.create_index("case_id", unique=True)
+        await db.approval_requests.create_index("approval_id", unique=True)
+    except Exception:
+        pass
+    global _OUTBOX_TASK
+    try:
+        if _OUTBOX_TASK is None:
+            _OUTBOX_TASK = asyncio.create_task(outbox_worker())
     except Exception:
         pass
     count = await db.entities.count_documents({})
@@ -820,19 +853,26 @@ async def admin_reject_wd(wd_id: str, user: dict = Depends(get_current_user)):
         {"$set": {"status": "rejected", "processed_at": datetime.now(timezone.utc).isoformat()}})
     if not wd:
         raise HTTPException(status_code=404, detail="Demande introuvable ou déjà traitée")
-    await add_transaction(wd["user_id"], f"Retrait refusé — remboursement {wd['amount_cc']} CC", wd["amount_cc"], "Retrait")
-    fee_cc = wd.get("fee_cc", 0) or 0
-    if fee_cc > 0:
-        # Reverse the withdrawal fee too: a rejected withdrawal must not cost the user the fee.
-        ftx = f"tx_{uuid.uuid4().hex[:10]}"
-        await db.transactions.insert_one({"tx_id": ftx, "user_id": wd["user_id"],
-                                          "label": f"Frais retrait remboursés — {fee_cc} CC", "amount": fee_cc,
-                                          "category": "Frais", "type": "in",
-                                          "created_at": datetime.now(timezone.utc).isoformat()})
-        await ledger_post(f"Frais retrait remboursés — {fee_cc} CC", "Frais",
-                          [(cash_acct(wd["user_id"]), fee_cc), (SYSTEM_ACCOUNTS["revenue"], -fee_cc)], ref=ftx)
-        await db.users.update_one({"user_id": wd["user_id"]}, {"$inc": {"balance_cc": fee_cc}})
-    await db.withdrawals.update_one({"wd_id": wd_id}, {"$set": {"status": "rejected", "processed_at": datetime.now(timezone.utc).isoformat()}})
+    try:
+        await add_transaction(wd["user_id"], f"Retrait refusé — remboursement {wd['amount_cc']} CC", wd["amount_cc"], "Retrait")
+        fee_cc = wd.get("fee_cc", 0) or 0
+        if fee_cc > 0:
+            # Reverse the withdrawal fee too: a rejected withdrawal must not cost the user the fee.
+            ftx = f"tx_{uuid.uuid4().hex[:10]}"
+            await db.transactions.insert_one({"tx_id": ftx, "user_id": wd["user_id"],
+                                              "label": f"Frais retrait remboursés — {fee_cc} CC", "amount": fee_cc,
+                                              "category": "Frais", "type": "in",
+                                              "created_at": datetime.now(timezone.utc).isoformat()})
+            await ledger_post(f"Frais retrait remboursés — {fee_cc} CC", "Frais",
+                              [(cash_acct(wd["user_id"]), fee_cc), (SYSTEM_ACCOUNTS["revenue"], -fee_cc)], ref=ftx)
+            await db.users.update_one({"user_id": wd["user_id"]}, {"$inc": {"balance_cc": fee_cc}})
+    except Exception:
+        # Compensation: a rejected withdrawal MUST refund; if posting failed, revert the flip to allow retry.
+        await db.withdrawals.update_one({"wd_id": wd_id}, {"$set": {"status": "pending", "processed_at": None}})
+        await db.recovery_journal.insert_one({"entry_id": f"rec_{uuid.uuid4().hex[:10]}", "kind": "withdrawal_reject_refund_failed",
+                                             "ref": wd_id, "classification": "CRITICAL",
+                                             "created_at": datetime.now(timezone.utc).isoformat()})
+        raise
     return {"ok": True}
 
 
@@ -1173,6 +1213,24 @@ async def financial_health(user: dict = Depends(get_current_user)):
     idem_processing = await db.idempotency_records.count_documents({"state": "PROCESSING"})
     holds_rep = await holds_integrity_report()
     active_holds = await db.balance_holds.count_documents({"status": {"$in": ["ACTIVE", "PARTIALLY_CAPTURED"]}})
+    # B4/B5 health
+    stuck_cut = (datetime.now(timezone.utc) - timedelta(hours=24)).isoformat()
+    settlements_health = {
+        "total": await db.settlements.count_documents({}),
+        "terminal": await db.settlements.count_documents({"internal_status": {"$in": list(SETTLEMENT_TERMINAL)}}),
+        "requires_review": await db.settlements.count_documents({"internal_status": "REQUIRES_REVIEW"}),
+        "stuck": await db.settlements.count_documents({"internal_status": {"$in": ["PENDING", "SUBMITTED", "PROCESSING"]}, "created_at": {"$lt": stuck_cut}}),
+    }
+    open_cases = await db.reconciliation_cases.count_documents({"status": {"$in": ["OPEN", "INVESTIGATING"]}})
+    high_cases = await db.reconciliation_cases.count_documents({"status": {"$in": ["OPEN", "INVESTIGATING"]}, "severity": "HIGH"})
+    outbox_health = {
+        "pending": await db.outbox_events.count_documents({"status": {"$in": ["PENDING", "RETRY", "DELIVERING"]}}),
+        "dead_letter": await db.outbox_events.count_documents({"status": "DEAD_LETTER"}),
+        "delivered": await db.outbox_events.count_documents({"status": "DELIVERED"}),
+    }
+    inbox_unprocessed = await db.webhook_inbox.count_documents({"processing_status": {"$ne": "PROCESSED"}})
+    pending_approvals = await db.approval_requests.count_documents({"status": "PENDING"})
+    b4b5_ok = (settlements_health["requires_review"] == 0 and high_cases == 0 and outbox_health["dead_letter"] == 0)
     return {
         "ledger_balanced": balanced,
         "per_asset_sum": {k: round(v, 6) for k, v in per_asset.items()},
@@ -1186,7 +1244,13 @@ async def financial_health(user: dict = Depends(get_current_user)):
         "refunds": await db.refunds.count_documents({}),
         "reversals": await db.reversals.count_documents({}),
         "holds_health": holds_rep,
-        "severity": "CRITICAL" if not (balanced and supply_ok and holds_rep["healthy"]) else "INFO",
+        "settlements": settlements_health,
+        "reconciliation_open_cases": open_cases,
+        "reconciliation_high_severity": high_cases,
+        "outbox": outbox_health,
+        "inbox_unprocessed": inbox_unprocessed,
+        "pending_approvals": pending_approvals,
+        "severity": "CRITICAL" if not (balanced and supply_ok and holds_rep["healthy"]) else ("HIGH" if not b4b5_ok else "INFO"),
     }
 
 @api_router.put("/admin/kill-switch")
@@ -1310,11 +1374,12 @@ CAPABILITY_STATUS = {
     "kyc_aml": "PLANNED",                    # needs KYC provider + legal (ACTIVATION)
     "invest": "PLANNED", "crypto": "PLANNED", "fx": "PLANNED",
     "business": "PLANNED", "rwa": "PLANNED", "open_banking": "PLANNED",
-    "reconciliation": "PARTIAL", "reporting": "PARTIAL",
+    "reconciliation": "REAL", "reporting": "PARTIAL",
     "idempotency_api": "REAL", "state_machines": "REAL", "holds": "REAL",
     "refund_engine": "REAL", "reversal_engine": "REAL", "settlement_engine": "PARTIAL",
-    "fees_engine": "REAL", "outbox_events": "PLANNED", "account_registry": "PARTIAL",
-    "asset_registry": "PARTIAL",
+    "fees_engine": "REAL", "outbox_events": "PARTIAL", "account_registry": "PARTIAL",
+    "asset_registry": "REAL", "maker_checker": "REAL", "recovery_engine": "REAL",
+    "monetary_precision": "PARTIAL", "provider_adapters": "MOCK",
 }
 
 @api_router.get("/system/status")
@@ -1723,6 +1788,579 @@ async def create_reversal(req: ReversalRequest, request: Request, user: dict = D
 async def list_reversals(user: dict = Depends(get_current_user)):
     await require_admin(user)
     return await db.reversals.find({}, {"_id": 0}).sort("created_at", -1).to_list(200)
+
+
+# ================= ASSET REGISTRY + MONEY (P0.1-B5 precision foundation) =================
+# Amounts are represented in "minor units" (smallest indivisible unit of the asset).
+# Rounding is CENTRALISED here. No opportunistic round() in business code.
+import decimal
+from decimal import Decimal, ROUND_HALF_UP
+
+ASSET_REGISTRY = {
+    "JCC": {"asset_code": "JCC", "decimals": 2, "minor_unit": 100, "rounding": "HALF_UP",
+            "enabled": True, "type": "internal_token"},
+    "EUR": {"asset_code": "EUR", "decimals": 2, "minor_unit": 100, "rounding": "HALF_UP",
+            "enabled": True, "type": "fiat"},
+}
+
+def asset_def(asset: str) -> dict:
+    a = ASSET_REGISTRY.get(asset)
+    if not a or not a["enabled"]:
+        raise HTTPException(status_code=400, detail=f"ASSET_NOT_SUPPORTED:{asset}")
+    return a
+
+def to_minor(amount, asset: str = DEFAULT_ASSET) -> int:
+    """Canonical conversion to integer minor units using the asset's rounding policy."""
+    a = asset_def(asset)
+    q = Decimal(str(amount)).quantize(Decimal(1).scaleb(-a["decimals"]), rounding=ROUND_HALF_UP)
+    return int((q * a["minor_unit"]).to_integral_value(rounding=ROUND_HALF_UP))
+
+def from_minor(minor: int, asset: str = DEFAULT_ASSET) -> float:
+    a = asset_def(asset)
+    return float(Decimal(int(minor)) / Decimal(a["minor_unit"]))
+
+def money_round(amount, asset: str = DEFAULT_ASSET) -> float:
+    """Round a float amount to the asset granularity (centralised rounding policy)."""
+    return from_minor(to_minor(amount, asset), asset)
+
+def is_minor_exact(amount, asset: str = DEFAULT_ASSET) -> bool:
+    a = asset_def(asset)
+    d = Decimal(str(amount)) * a["minor_unit"]
+    return d == d.to_integral_value()
+
+@api_router.get("/assets")
+async def list_assets(user: dict = Depends(get_current_user)):
+    return list(ASSET_REGISTRY.values())
+
+
+# ================= P0.1-B4: SETTLEMENT / RECONCILIATION / OUTBOX / INBOX =================
+# Settlement is a TRACKING layer over provider interactions for already-captured ledger
+# movements. It does NOT re-post value (no second ledger). Reconciliation compares the
+# internal expected state against the external observed state and opens cases for mismatches.
+SETTLEMENT_TRANSITIONS = {
+    "PENDING": {"SUBMITTED", "PROCESSING", "SETTLED", "FAILED", "CANCELLED", "REQUIRES_REVIEW"},
+    "SUBMITTED": {"PROCESSING", "SETTLED", "FAILED", "CANCELLED", "REQUIRES_REVIEW"},
+    "PROCESSING": {"SETTLED", "FAILED", "REQUIRES_REVIEW"},
+    "REQUIRES_REVIEW": {"SETTLED", "FAILED", "CANCELLED"},
+    "SETTLED": set(), "FAILED": set(), "CANCELLED": set(),
+}
+SETTLEMENT_TERMINAL = {"SETTLED", "FAILED", "CANCELLED"}
+
+def _settlement_predecessors(target: str):
+    return [s for s, tos in SETTLEMENT_TRANSITIONS.items() if target in tos]
+
+# ---- Provider adapter boundary (providers NEVER touch ledger/balances/holds directly) ----
+class MockProviderAdapter:
+    """Honest MOCK adapter. Real issuers/banks/brokers/custodians plug in here later.
+    A provider only reports external state; the Financial Core owns all value mutations."""
+    status = "MOCK"
+    def __init__(self, name): self.name = name
+    async def submit(self, settlement: dict) -> dict:
+        return {"provider_reference": f"{self.name}_ref_{uuid.uuid4().hex[:10]}", "external_status": "processing"}
+
+PROVIDERS = {"mock_bank": MockProviderAdapter("mock_bank"), "mock_processor": MockProviderAdapter("mock_processor")}
+
+def get_provider(name: str):
+    p = PROVIDERS.get(name)
+    if not p:
+        raise HTTPException(status_code=400, detail=f"PROVIDER_UNKNOWN:{name}")
+    return p
+
+# ---- Transactional Outbox (PARTIAL on standalone MongoDB: no multi-doc atomicity) ----
+# Correctness strategy: events are idempotent (dedup by event_id), delivery is at-least-once,
+# and the recovery scanner detects/regenerates missing events. This is NOT a strict
+# transactional outbox — status is therefore PARTIAL, documented honestly.
+async def emit_event(event_type, aggregate_type, aggregate_id, payload, correlation_id=None, event_id=None, causation_id=None):
+    eid = event_id or f"evt_{uuid.uuid4().hex[:12]}"
+    from pymongo.errors import DuplicateKeyError
+    try:
+        await db.outbox_events.insert_one({
+            "event_id": eid, "event_type": event_type, "aggregate_type": aggregate_type,
+            "aggregate_id": aggregate_id, "correlation_id": correlation_id, "causation_id": causation_id,
+            "payload": payload, "status": "PENDING", "attempts": 0,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "available_at": datetime.now(timezone.utc).isoformat(),
+            "delivered_at": None, "last_error": None})
+    except DuplicateKeyError:
+        pass  # idempotent emit
+    return eid
+
+async def _deliver_event(ev: dict) -> bool:
+    """Internal at-least-once consumer. Consumer MUST tolerate duplicates -> dedup by event_id."""
+    from pymongo.errors import DuplicateKeyError
+    try:
+        await db.outbox_consumed.insert_one({"event_id": ev["event_id"],
+                                             "consumed_at": datetime.now(timezone.utc).isoformat()})
+    except DuplicateKeyError:
+        return True  # already consumed once -> single business effect
+    return True
+
+_OUTBOX_TASK = None
+async def outbox_worker():
+    while True:
+        try:
+            now = datetime.now(timezone.utc).isoformat()
+            async for ev in db.outbox_events.find(
+                    {"status": {"$in": ["PENDING", "RETRY"]}, "available_at": {"$lte": now}}).limit(50):
+                claimed = await db.outbox_events.find_one_and_update(
+                    {"event_id": ev["event_id"], "status": {"$in": ["PENDING", "RETRY"]}},
+                    {"$set": {"status": "DELIVERING"}, "$inc": {"attempts": 1}},
+                    return_document=ReturnDocument.AFTER)
+                if not claimed:
+                    continue
+                try:
+                    ok = await _deliver_event(claimed)
+                    if ok:
+                        await db.outbox_events.update_one({"event_id": ev["event_id"]},
+                            {"$set": {"status": "DELIVERED", "delivered_at": datetime.now(timezone.utc).isoformat()}})
+                except Exception as e:
+                    attempts = claimed.get("attempts", 1)
+                    backoff = min(60, 2 ** attempts)
+                    nxt = (datetime.now(timezone.utc) + timedelta(seconds=backoff)).isoformat()
+                    status = "DEAD_LETTER" if attempts >= 8 else "RETRY"
+                    await db.outbox_events.update_one({"event_id": ev["event_id"]},
+                        {"$set": {"status": status, "available_at": nxt, "last_error": str(e)[:200]}})
+        except Exception:
+            pass
+        await asyncio.sleep(2)
+
+# ---- Settlement models + endpoints ----
+class SettlementCreate(BaseModel):
+    transaction_id: str
+    provider: str
+    direction: str = "payout"   # payout | payin
+    asset: str = DEFAULT_ASSET
+
+async def settlement_transition(settlement_id, target, actor, reason=""):
+    now = datetime.now(timezone.utc).isoformat()
+    st = await db.settlements.find_one_and_update(
+        {"settlement_id": settlement_id, "internal_status": {"$in": _settlement_predecessors(target)}},
+        {"$set": {"internal_status": target, "updated_at": now,
+                  **({"settled_at": now} if target == "SETTLED" else {})}},
+        return_document=ReturnDocument.AFTER)
+    if not st:
+        return None
+    await record_state("settlement", settlement_id, None, target, actor, reason, st.get("correlation_id"))
+    await emit_event(f"Financial.Settlement{target.title().replace('_','')}", "settlement", settlement_id,
+                     {"internal_status": target}, correlation_id=st.get("correlation_id"))
+    return st
+
+@api_router.post("/admin/settlements")
+async def create_settlement(req: SettlementCreate, request: Request, user: dict = Depends(get_current_user)):
+    await require_admin(user)
+    idem_id, cached = await idem_begin(request, user, "settlement", req.dict())
+    if cached is not None:
+        return cached
+    try:
+        asset_def(req.asset)
+        tx = await db.transactions.find_one({"tx_id": req.transaction_id}, {"_id": 0})
+        if not tx:
+            raise HTTPException(status_code=404, detail="TRANSACTION_NOT_FOUND")
+        get_provider(req.provider)
+        amount = abs(tx["amount"])
+        sid = f"stl_{uuid.uuid4().hex[:10]}"
+        corr = f"corr_{uuid.uuid4().hex[:10]}"
+        doc = {"settlement_id": sid, "transaction_id": req.transaction_id, "user_id": tx.get("user_id"),
+               "provider": req.provider, "provider_reference": None, "asset": req.asset,
+               "amount": amount, "amount_minor": to_minor(amount, req.asset), "direction": req.direction,
+               "internal_status": "PENDING", "external_status": None, "reconciliation_status": "UNRECONCILED",
+               "correlation_id": corr, "idempotency_key": f"stl:{req.transaction_id}",
+               "failure_code": None, "failure_reason": None, "retry_count": 0,
+               "created_at": datetime.now(timezone.utc).isoformat(), "updated_at": datetime.now(timezone.utc).isoformat(),
+               "settled_at": None}
+        try:
+            await db.settlements.insert_one(dict(doc))
+        except Exception:
+            existing = await db.settlements.find_one({"idempotency_key": f"stl:{req.transaction_id}"}, {"_id": 0})
+            if existing:
+                return await idem_finish(idem_id, existing)
+            raise
+        await record_state("settlement", sid, None, "PENDING", user["user_id"], "created", corr)
+        await emit_event("Financial.SettlementCreated", "settlement", sid, {"amount": amount}, correlation_id=corr)
+        doc.pop("_id", None)
+        return await idem_finish(idem_id, doc)
+    except Exception:
+        await idem_fail(idem_id)
+        raise
+
+@api_router.post("/admin/settlements/{settlement_id}/submit")
+async def submit_settlement(settlement_id: str, user: dict = Depends(get_current_user)):
+    await require_admin(user)
+    s = await db.settlements.find_one({"settlement_id": settlement_id}, {"_id": 0})
+    if not s:
+        raise HTTPException(status_code=404, detail="SETTLEMENT_NOT_FOUND")
+    provider = get_provider(s["provider"])
+    st = await settlement_transition(settlement_id, "SUBMITTED", user["user_id"], "submit")
+    if not st:
+        # Retry path: if a prior submit crashed after the transition but before the ref write,
+        # allow re-submit while status==SUBMITTED and provider_reference is still null.
+        if not (s["internal_status"] == "SUBMITTED" and not s.get("provider_reference")):
+            raise HTTPException(status_code=409, detail=f"INVALID_TRANSITION_FROM:{s['internal_status']}")
+    res = await provider.submit(s)  # provider only returns external state
+    await db.settlements.update_one({"settlement_id": settlement_id},
+        {"$set": {"provider_reference": res["provider_reference"], "external_status": res["external_status"]}})
+    await emit_event("Financial.SettlementSubmitted", "settlement", settlement_id,
+                     {"provider_reference": res["provider_reference"]}, correlation_id=s.get("correlation_id"))
+    return await db.settlements.find_one({"settlement_id": settlement_id}, {"_id": 0})
+
+@api_router.get("/admin/settlements")
+async def list_settlements(user: dict = Depends(get_current_user)):
+    await require_admin(user)
+    return await db.settlements.find({}, {"_id": 0}).sort("created_at", -1).to_list(200)
+
+@api_router.get("/admin/settlements/{settlement_id}")
+async def get_settlement(settlement_id: str, user: dict = Depends(get_current_user)):
+    await require_admin(user)
+    s = await db.settlements.find_one({"settlement_id": settlement_id}, {"_id": 0})
+    if not s:
+        raise HTTPException(status_code=404, detail="SETTLEMENT_NOT_FOUND")
+    hist = await db.financial_state_history.find({"entity_type": "settlement", "entity_id": settlement_id}, {"_id": 0}).sort("created_at", 1).to_list(100)
+    return {**s, "history": hist}
+
+# ---- Provider webhook inbox (dedup + out-of-order safe) ----
+_WEBHOOK_STATUS_MAP = {"processing": "PROCESSING", "settled": "SETTLED", "paid": "SETTLED",
+                       "failed": "FAILED", "cancelled": "CANCELLED"}
+
+@api_router.post("/webhooks/{provider}")
+async def provider_webhook(provider: str, request: Request):
+    body = await request.json()
+    provider_event_id = body.get("event_id") or body.get("id")
+    if not provider_event_id:
+        raise HTTPException(status_code=400, detail="MISSING_PROVIDER_EVENT_ID")
+    import hashlib, json as _json
+    from pymongo.errors import DuplicateKeyError
+    phash = hashlib.sha256(_json.dumps(body, sort_keys=True, default=str).encode()).hexdigest()
+    try:
+        await db.webhook_inbox.insert_one({
+            "provider": provider, "provider_event_id": provider_event_id, "payload_hash": phash,
+            "received_at": datetime.now(timezone.utc).isoformat(), "processing_status": "RECEIVED",
+            "attempts": 0, "last_error": None, "payload": body})
+    except DuplicateKeyError:
+        prev = await db.webhook_inbox.find_one({"provider": provider, "provider_event_id": provider_event_id}, {"_id": 0, "payload_hash": 1})
+        if prev and prev.get("payload_hash") != phash:
+            # Same event_id, DIFFERENT body -> conflict, not a benign retry.
+            await emit_event("Financial.ProviderWebhookConflict", "webhook", provider_event_id, {"provider": provider})
+            return {"status": "duplicate_conflict"}
+        await emit_event("Financial.ProviderWebhookDuplicate", "webhook", provider_event_id, {"provider": provider})
+        return {"status": "duplicate_ignored"}  # same webhook N times -> 1 effect
+    await emit_event("Financial.ProviderWebhookReceived", "webhook", provider_event_id, {"provider": provider})
+    await db.webhook_inbox.update_one({"provider": provider, "provider_event_id": provider_event_id},
+                                      {"$inc": {"attempts": 1}})
+    ref = body.get("provider_reference"); ext = str(body.get("status", "")).lower()
+    target = _WEBHOOK_STATUS_MAP.get(ext)
+    result = "no_action"
+    if ref and target:
+        # SECURITY: scope to the provider in the URL — a webhook for provider A can never
+        # drive a settlement that belongs to provider B.
+        s = await db.settlements.find_one({"provider_reference": ref, "provider": provider}, {"_id": 0})
+        if not s:
+            # Security signal: a reference that exists under a DIFFERENT provider = scope/spoof attempt.
+            other = await db.settlements.find_one({"provider_reference": ref}, {"_id": 0, "provider": 1})
+            if other:
+                await emit_event("Financial.ProviderScopeViolation", "settlement", ref,
+                                 {"posted_to": provider, "belongs_to": other["provider"]})
+                await db.webhook_inbox.update_one({"provider": provider, "provider_event_id": provider_event_id},
+                                                  {"$set": {"processing_status": "SCOPE_VIOLATION"}})
+                return {"status": "processed", "result": "scope_violation"}
+        if s:
+            await db.settlements.update_one({"settlement_id": s["settlement_id"]}, {"$set": {"external_status": ext}})
+            st = await settlement_transition(s["settlement_id"], target, f"webhook:{provider}", f"event={provider_event_id}")
+            if st:
+                result = f"applied:{target}"
+            else:
+                # Out-of-order or terminal: cannot apply -> record conflict, do NOT blindly override.
+                cur = await db.settlements.find_one({"settlement_id": s["settlement_id"]}, {"_id": 0, "internal_status": 1})
+                if cur["internal_status"] not in SETTLEMENT_TERMINAL:
+                    await settlement_transition(s["settlement_id"], "REQUIRES_REVIEW", f"webhook:{provider}", "out_of_order")
+                    result = "review"
+                else:
+                    result = "ignored_terminal"
+                await emit_event("Financial.ProviderStateConflict", "settlement", s["settlement_id"],
+                                 {"attempted": target, "current": cur["internal_status"]})
+    await db.webhook_inbox.update_one({"provider": provider, "provider_event_id": provider_event_id},
+                                      {"$set": {"processing_status": "PROCESSED", "result": result}})
+    return {"status": "processed", "result": result}
+
+# ---- Reconciliation engine + cases ----
+async def run_reconciliation():
+    """Compare internal settlements vs external observed. Opens cases for mismatches.
+    Never corrects silently: every discrepancy becomes an auditable ReconciliationCase."""
+    opened = 0
+    async for s in db.settlements.find({}, {"_id": 0}):
+        mismatch = None
+        # submitted/processing settlements without a provider reference (should have one)
+        if s["internal_status"] in ("SUBMITTED", "PROCESSING") and not s.get("provider_reference"):
+            mismatch = "missing_provider_reference"
+        # settled internally but external status not terminal
+        elif s["internal_status"] == "SETTLED" and s.get("external_status") not in ("settled", "paid"):
+            mismatch = "status_mismatch"
+        # amount vs linked ledger tx
+        else:
+            tx = await db.transactions.find_one({"tx_id": s["transaction_id"]}, {"_id": 0})
+            if tx and abs(abs(tx["amount"]) - s["amount"]) > 0.005:
+                mismatch = "amount_mismatch"
+        if mismatch:
+            exists = await db.reconciliation_cases.find_one(
+                {"settlement_id": s["settlement_id"], "mismatch_type": mismatch, "status": {"$in": ["OPEN", "INVESTIGATING"]}}, {"_id": 0})
+            if not exists:
+                cid = f"rc_{uuid.uuid4().hex[:10]}"
+                await db.reconciliation_cases.insert_one({
+                    "case_id": cid, "provider": s["provider"], "transaction_id": s["transaction_id"],
+                    "settlement_id": s["settlement_id"], "provider_reference": s.get("provider_reference"),
+                    "mismatch_type": mismatch, "expected": s["internal_status"], "observed": s.get("external_status"),
+                    "severity": "HIGH" if mismatch == "amount_mismatch" else "MEDIUM", "status": "OPEN",
+                    "resolution": None, "created_at": datetime.now(timezone.utc).isoformat(),
+                    "updated_at": datetime.now(timezone.utc).isoformat(), "resolved_at": None})
+                await emit_event("Financial.ReconciliationMismatch", "reconciliation", cid, {"mismatch": mismatch})
+                opened += 1
+    return opened
+
+@api_router.post("/admin/reconciliation/run")
+async def reconciliation_run(user: dict = Depends(get_current_user)):
+    await require_admin(user)
+    opened = await run_reconciliation()
+    return {"ok": True, "cases_opened": opened}
+
+@api_router.get("/admin/reconciliation/cases")
+async def reconciliation_cases(user: dict = Depends(get_current_user)):
+    await require_admin(user)
+    return await db.reconciliation_cases.find({}, {"_id": 0}).sort("created_at", -1).to_list(200)
+
+@api_router.post("/admin/reconciliation/cases/{case_id}/resolve")
+async def resolve_case(case_id: str, req: dict, user: dict = Depends(get_current_user)):
+    await require_admin(user)
+    resolution = req.get("resolution", "ACCEPTED_DIFFERENCE")
+    if resolution not in ("RESOLVED", "ACCEPTED_DIFFERENCE", "ESCALATED"):
+        raise HTTPException(status_code=400, detail="Résolution invalide")
+    c = await db.reconciliation_cases.find_one_and_update(
+        {"case_id": case_id, "status": {"$in": ["OPEN", "INVESTIGATING"]}},
+        {"$set": {"status": resolution, "resolution": req.get("note", ""), "reviewer": user["user_id"],
+                  "resolved_at": datetime.now(timezone.utc).isoformat(),
+                  "updated_at": datetime.now(timezone.utc).isoformat()}},
+        return_document=ReturnDocument.AFTER)
+    if not c:
+        raise HTTPException(status_code=409, detail="Cas introuvable ou déjà résolu")
+    c.pop("_id", None)
+    await emit_event("Financial.ReconciliationResolved", "reconciliation", case_id, {"resolution": resolution})
+    await audit(user["user_id"], "Financial.ReconciliationResolved", {"case_id": case_id, "resolution": resolution})
+    return c
+
+@api_router.get("/admin/outbox")
+async def list_outbox(user: dict = Depends(get_current_user), status: Optional[str] = None):
+    await require_admin(user)
+    q = {"status": status} if status else {}
+    return await db.outbox_events.find(q, {"_id": 0}).sort("created_at", -1).to_list(200)
+
+@api_router.post("/admin/outbox/{event_id}/replay")
+async def replay_outbox(event_id: str, user: dict = Depends(get_current_user)):
+    await require_admin(user)
+    # Safe replay: reset to RETRY; the consumer is idempotent (dedup by event_id).
+    r = await db.outbox_events.update_one({"event_id": event_id},
+        {"$set": {"status": "RETRY", "available_at": datetime.now(timezone.utc).isoformat()}})
+    if r.matched_count == 0:
+        raise HTTPException(status_code=404, detail="Événement introuvable")
+    return {"ok": True}
+
+
+# ================= P0.1-B5: MAKER-CHECKER + RECOVERY =================
+# Sensitive admin financial operations require a second, DIFFERENT approver.
+SENSITIVE_OPS = {"manual_ledger_adjustment", "fee_policy_change", "kill_switch_critical",
+                 "high_value_refund", "settlement_override"}
+
+class ApprovalCreate(BaseModel):
+    operation_type: str
+    payload: dict = {}
+    reason: str = ""
+
+def _payload_hash(payload: dict) -> str:
+    import hashlib, json as _json
+    return hashlib.sha256(_json.dumps(payload, sort_keys=True, default=str).encode()).hexdigest()
+
+@api_router.post("/admin/approvals")
+async def create_approval(req: ApprovalCreate, user: dict = Depends(get_current_user)):
+    await require_admin(user)
+    if req.operation_type not in SENSITIVE_OPS:
+        raise HTTPException(status_code=400, detail=f"OPERATION_NOT_SENSITIVE:{req.operation_type}")
+    aid = f"apr_{uuid.uuid4().hex[:10]}"
+    doc = {"approval_id": aid, "operation_type": req.operation_type, "payload": req.payload,
+           "operation_payload_hash": _payload_hash(req.payload), "maker_id": user["user_id"],
+           "checker_id": None, "status": "PENDING", "reason": req.reason,
+           "correlation_id": f"corr_{uuid.uuid4().hex[:10]}", "execution_status": "NONE",
+           "created_at": datetime.now(timezone.utc).isoformat(),
+           "expires_at": (datetime.now(timezone.utc) + timedelta(hours=24)).isoformat(),
+           "approved_at": None, "rejected_at": None}
+    await db.approval_requests.insert_one(dict(doc))
+    await audit(user["user_id"], "MakerChecker.RequestCreated", {"approval_id": aid, "op": req.operation_type})
+    doc.pop("_id", None)
+    return doc
+
+async def _execute_approved_operation(appr: dict):
+    op = appr["operation_type"]; p = appr["payload"]
+    if op == "fee_policy_change":
+        policy = p.get("fee_policy", {})
+        await db.settings.update_one({"key": "app"}, {"$set": {"fee_policy": policy}}, upsert=True)
+    elif op == "kill_switch_critical":
+        name = p.get("name")
+        if name in ("withdrawals", "card", "agents"):
+            await db.settings.update_one({"key": "app"}, {"$set": {f"ks_{name}": bool(p.get("enabled"))}}, upsert=True)
+    elif op == "manual_ledger_adjustment":
+        # value-affecting: MUST go through the ledger (balanced 2-leg entry).
+        acc = p["account_id"]; counter = p.get("counter_account", SYSTEM_ACCOUNTS["clearing"]); amt = money_round(p["amount"])
+        await ledger_post(f"Ajustement manuel — {appr['reason']}", "Ajustement",
+                          [(acc, amt), (counter, -amt)], ref=appr["approval_id"])
+        if acc.startswith("acct_cash_"):
+            await db.users.update_one({"user_id": acc.replace("acct_cash_", "")}, {"$inc": {"balance_cc": amt}})
+    # settlement_override / high_value_refund: recorded + audited (no blind value creation here)
+    await emit_event("Financial.MakerCheckerExecuted", "approval", appr["approval_id"], {"op": op})
+
+@api_router.post("/admin/approvals/{approval_id}/approve")
+async def approve_approval(approval_id: str, user: dict = Depends(get_current_user)):
+    await require_admin(user)
+    appr = await db.approval_requests.find_one({"approval_id": approval_id}, {"_id": 0})
+    if not appr:
+        raise HTTPException(status_code=404, detail="Demande introuvable")
+    # BACKEND enforcement: maker != checker (not just UI).
+    if appr["maker_id"] == user["user_id"]:
+        raise HTTPException(status_code=403, detail="MAKER_CANNOT_BE_CHECKER")
+    exp = datetime.fromisoformat(appr["expires_at"])
+    if exp.tzinfo is None:
+        exp = exp.replace(tzinfo=timezone.utc)
+    if exp < datetime.now(timezone.utc):
+        raise HTTPException(status_code=409, detail="APPROVAL_EXPIRED")
+    # Payload immutability guard: hash must still match.
+    if appr["operation_payload_hash"] != _payload_hash(appr["payload"]):
+        raise HTTPException(status_code=409, detail="PAYLOAD_TAMPERED")
+    # SINGLE EXECUTION: atomic status flip is the lock -> concurrent checkers can't double-execute.
+    claimed = await db.approval_requests.find_one_and_update(
+        {"approval_id": approval_id, "status": "PENDING", "maker_id": {"$ne": user["user_id"]}},
+        {"$set": {"status": "APPROVED", "checker_id": user["user_id"],
+                  "approved_at": datetime.now(timezone.utc).isoformat(), "execution_status": "EXECUTING"}},
+        return_document=ReturnDocument.AFTER)
+    if not claimed:
+        raise HTTPException(status_code=409, detail="ALREADY_DECIDED_OR_INVALID")
+    try:
+        await _execute_approved_operation(claimed)
+        await db.approval_requests.update_one({"approval_id": approval_id}, {"$set": {"execution_status": "EXECUTED"}})
+    except Exception as e:
+        await db.approval_requests.update_one({"approval_id": approval_id},
+            {"$set": {"execution_status": "FAILED", "execution_error": str(e)[:200]}})
+        await db.recovery_journal.insert_one({"entry_id": f"rec_{uuid.uuid4().hex[:10]}", "kind": "approval_execution_failed",
+            "ref": approval_id, "classification": "MANUAL_REVIEW", "detail": str(e)[:200],
+            "created_at": datetime.now(timezone.utc).isoformat()})
+        raise
+    await audit(user["user_id"], "MakerChecker.Approved", {"approval_id": approval_id, "op": claimed["operation_type"]})
+    return {"ok": True, "status": "APPROVED", "execution_status": "EXECUTED"}
+
+@api_router.post("/admin/approvals/{approval_id}/reject")
+async def reject_approval(approval_id: str, user: dict = Depends(get_current_user)):
+    await require_admin(user)
+    appr = await db.approval_requests.find_one({"approval_id": approval_id}, {"_id": 0})
+    if not appr:
+        raise HTTPException(status_code=404, detail="Demande introuvable")
+    if appr["maker_id"] == user["user_id"]:
+        raise HTTPException(status_code=403, detail="MAKER_CANNOT_BE_CHECKER")
+    r = await db.approval_requests.find_one_and_update(
+        {"approval_id": approval_id, "status": "PENDING"},
+        {"$set": {"status": "REJECTED", "checker_id": user["user_id"], "rejected_at": datetime.now(timezone.utc).isoformat()}})
+    if not r:
+        raise HTTPException(status_code=409, detail="ALREADY_DECIDED")
+    await audit(user["user_id"], "MakerChecker.Rejected", {"approval_id": approval_id})
+    return {"ok": True, "status": "REJECTED"}
+
+@api_router.get("/admin/approvals")
+async def list_approvals(user: dict = Depends(get_current_user)):
+    await require_admin(user)
+    return await db.approval_requests.find({}, {"_id": 0}).sort("created_at", -1).to_list(200)
+
+# ---- Recovery: operational journal + scanner (correctness independent of any worker) ----
+@api_router.post("/admin/recovery/scan")
+async def recovery_scan(user: dict = Depends(get_current_user)):
+    await require_admin(user)
+    now = datetime.now(timezone.utc)
+    now_iso = now.isoformat()
+    findings = {"stale_idempotency": 0, "expired_active_holds": 0, "stuck_settlements": 0,
+                "undelivered_outbox": 0, "dead_letter_outbox": 0, "unprocessed_inbox": 0, "expired_approvals": 0}
+    classification = {"AUTO_RECOVERABLE": [], "MANUAL_REVIEW": [], "CRITICAL": []}
+    stale_cut = (now - timedelta(minutes=15)).isoformat()
+    findings["stale_idempotency"] = await db.idempotency_records.count_documents({"state": "PROCESSING", "created_at": {"$lt": stale_cut}})
+    if findings["stale_idempotency"]:
+        classification["AUTO_RECOVERABLE"].append("stale_idempotency")
+    findings["expired_active_holds"] = await db.balance_holds.count_documents(
+        {"status": {"$in": ["ACTIVE", "PARTIALLY_CAPTURED"]}, "expires_at": {"$lte": now_iso}})
+    if findings["expired_active_holds"]:
+        classification["AUTO_RECOVERABLE"].append("expired_active_holds")
+    stuck_cut = (now - timedelta(hours=24)).isoformat()
+    findings["stuck_settlements"] = await db.settlements.count_documents(
+        {"internal_status": {"$in": ["PENDING", "SUBMITTED", "PROCESSING"]}, "created_at": {"$lt": stuck_cut}})
+    if findings["stuck_settlements"]:
+        classification["MANUAL_REVIEW"].append("stuck_settlements")
+    findings["undelivered_outbox"] = await db.outbox_events.count_documents({"status": {"$in": ["PENDING", "RETRY", "DELIVERING"]}})
+    findings["dead_letter_outbox"] = await db.outbox_events.count_documents({"status": "DEAD_LETTER"})
+    if findings["dead_letter_outbox"]:
+        classification["CRITICAL"].append("dead_letter_outbox")
+    findings["unprocessed_inbox"] = await db.webhook_inbox.count_documents({"processing_status": {"$ne": "PROCESSED"}})
+    if findings["unprocessed_inbox"]:
+        classification["MANUAL_REVIEW"].append("unprocessed_inbox")
+    findings["expired_approvals"] = await db.approval_requests.count_documents({"status": "PENDING", "expires_at": {"$lt": now_iso}})
+    if findings["expired_approvals"]:
+        classification["AUTO_RECOVERABLE"].append("expired_approvals")
+    await db.recovery_journal.insert_one({"entry_id": f"rec_{uuid.uuid4().hex[:10]}", "kind": "scan",
+        "findings": findings, "classification": classification, "created_at": now_iso})
+    return {"findings": findings, "classification": classification}
+
+@api_router.post("/admin/recovery/auto-heal")
+async def recovery_auto_heal(user: dict = Depends(get_current_user)):
+    await require_admin(user)
+    # Only AUTO_RECOVERABLE actions. Idempotent + safe.
+    healed = {}
+    stale_cut = (datetime.now(timezone.utc) - timedelta(minutes=15)).isoformat()
+    r = await db.idempotency_records.delete_many({"state": "PROCESSING", "created_at": {"$lt": stale_cut}})
+    healed["stale_idempotency_cleared"] = r.deleted_count
+    # lazy-expire all overdue holds across users
+    expired = 0
+    async for h in db.balance_holds.find({"status": {"$in": ["ACTIVE", "PARTIALLY_CAPTURED"]},
+                                         "expires_at": {"$lte": datetime.now(timezone.utc).isoformat()}}, {"_id": 0, "hold_id": 1}):
+        if await _terminate_hold(h["hold_id"], "EXPIRED", "recovery", "auto_heal"):
+            expired += 1
+    healed["holds_expired"] = expired
+    # expire stale PENDING approvals (idempotent)
+    now_iso = datetime.now(timezone.utc).isoformat()
+    ra = await db.approval_requests.update_many({"status": "PENDING", "expires_at": {"$lt": now_iso}},
+                                                {"$set": {"status": "EXPIRED"}})
+    healed["approvals_expired"] = ra.modified_count
+    await db.recovery_journal.insert_one({"entry_id": f"rec_{uuid.uuid4().hex[:10]}", "kind": "auto_heal",
+        "healed": healed, "created_at": datetime.now(timezone.utc).isoformat()})
+    return {"ok": True, "healed": healed}
+
+@api_router.get("/admin/recovery/journal")
+async def recovery_journal_list(user: dict = Depends(get_current_user)):
+    await require_admin(user)
+    return await db.recovery_journal.find({}, {"_id": 0}).sort("created_at", -1).to_list(100)
+
+# ---- Monetary precision migration (dry-run, non-destructive, auditable) ----
+@api_router.post("/admin/precision/migrate")
+async def precision_migrate(user: dict = Depends(get_current_user), dry_run: bool = True):
+    await require_admin(user)
+    if not dry_run:
+        # Honest: destructive integer-storage migration is not implemented yet (monetary_precision=PARTIAL).
+        raise HTTPException(status_code=501, detail="DESTRUCTIVE_MIGRATION_NOT_IMPLEMENTED (monetary_precision=PARTIAL)")
+    report = {"dry_run": dry_run, "ledger_postings_checked": 0, "non_representable_postings": [],
+              "balances_checked": 0, "non_representable_balances": [], "economic_equality": True}
+    async for e in db.ledger_entries.find({}, {"_id": 0, "entry_id": 1, "asset": 1, "postings": 1}):
+        asset = e.get("asset", DEFAULT_ASSET)
+        for p in e["postings"]:
+            report["ledger_postings_checked"] += 1
+            if asset in ASSET_REGISTRY and not is_minor_exact(p["amount"], asset):
+                report["non_representable_postings"].append({"entry_id": e["entry_id"], "amount": p["amount"]})
+    async for u in db.users.find({}, {"user_id": 1, "balance_cc": 1}):
+        report["balances_checked"] += 1
+        if not is_minor_exact(u.get("balance_cc", 0), DEFAULT_ASSET):
+            report["non_representable_balances"].append({"user_id": u["user_id"], "balance_cc": u.get("balance_cc", 0)})
+    report["representable"] = not (report["non_representable_postings"] or report["non_representable_balances"])
+    await db.recovery_journal.insert_one({"entry_id": f"rec_{uuid.uuid4().hex[:10]}", "kind": "precision_migration",
+        "report": {k: v for k, v in report.items() if not isinstance(v, list)}, "created_at": datetime.now(timezone.utc).isoformat()})
+    return report
+
 
 
 app.include_router(api_router)

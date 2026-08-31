@@ -80,3 +80,21 @@ Premium fintech wallet (Revolut/Qonto style) for CVLN Group cultural ecosystem. 
 - Doc: CVLN-REFUND-REVERSAL-FEES.md.
 - Vérifié testing_agent iterations 5+6: 129 tests verts + concurrence réelle (12×25 retraits→exactement 4 gagnants, refunds 24-way jamais over-refund, reversals 16-way un seul gagnant, reject 12-way un seul crédit). 5 défauts iteration_5 corrigés + 1 CRITICAL TOCTOU reject trouvé iteration_6 et corrigé (vérifié curl: balance 300 pas 400).
 - Prochain: **P0.1-B4** Settlement + Reconciliation + Transactional Outbox, puis B5 Decimal/minor-units + Maker/Checker + Recovery.
+
+## Update 2026-06 — P0.1-B4 + B5 + AUDIT + FREEZE (Financial Core v1)
+**B4 (Settlement/Reconciliation/Outbox/Inbox):**
+- Settlement model + state machine (PENDING→SUBMITTED→PROCESSING→SETTLED / FAILED / CANCELLED / REQUIRES_REVIEW), transitions atomiques single-winner, history append-only. Settlement = couche de suivi (ne re-poste PAS de valeur).
+- Provider adapter boundary (MockProviderAdapter, MOCK) — un provider ne touche jamais ledger/balances/holds.
+- Webhook inbox `POST /api/webhooks/{provider}` : dedup unique (provider, event_id), 100 doublons→1 effet, conflit de payload, hors-ordre→REQUIRES_REVIEW/ignored_terminal, **provider-scoped** (fix CRITICAL cross-provider) + scope-violation signal.
+- Reconciliation engine + cases (aucune correction silencieuse) + resolve atomique.
+- Outbox `outbox_events` + worker background at-least-once + consumer idempotent (`outbox_consumed`) + backoff/dead-letter + replay. Statut **PARTIAL** (pas d'atomicité multi-doc sur Mongo standalone — honnête).
+**B5 (Precision/Maker-Checker/Recovery):**
+- Asset Registry (JCC/EUR, minor-units) + helpers Money/`money_round`/`is_minor_exact` (rounding centralisé, Decimal). `GET /api/assets`. Migration dry-run non-destructive; `dry_run=false`→501 (monetary_precision **PARTIAL**, honnête).
+- Maker-Checker REAL : `approval_requests`, maker≠checker enforcé backend (403), payload hash immutable, exécution unique atomique (20 concurrents→1), expiry, dispatch (fee_policy/kill_switch/manual_ledger_adjustment via ledger).
+- Recovery REAL : scan (classification AUTO_RECOVERABLE/MANUAL_REVIEW/CRITICAL) + auto-heal idempotent + recovery_journal.
+**AUDIT transversal → correctifs :**
+- HIGH systémique : send/coffre-move/marketplace/entity-charge contournaient les holds (read-then-write) → tous routés par `atomic_spend` (atomique, hold-aware). Vérifié concurrence.
+**Statuts /api/system/status :** asset_registry/maker_checker/recovery_engine/reconciliation=REAL ; settlement_engine/outbox_events/monetary_precision=PARTIAL ; provider_adapters/card_issuing=MOCK ; stripe=SANDBOX ; invest/crypto/fx=PLANNED.
+**Tests :** 197 tests verts (pytest série) + testing_agent iter 7-8 (0 CRITICAL/HIGH ouvert). Ledger équilibré, supply réconciliée, holds sains, available≥0.
+- Docs : CVLN-SETTLEMENT-RECONCILIATION, CVLN-OUTBOX-INBOX-DELIVERY, CVLN-MONETARY-PRECISION, CVLN-MAKER-CHECKER, CVLN-FINANCIAL-RECOVERY, CVLN-FINANCIAL-CORE-FREEZE-V1.
+- **CVLN WALLET FINANCIAL CORE v1 — BASELINE FROZEN.** Prochain (hors gel) : brancher providers réels + domaines BUILD/ACTIVATION (Invest→Crypto→FX→Card prod→KYC).
