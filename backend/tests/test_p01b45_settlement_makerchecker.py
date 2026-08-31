@@ -831,7 +831,7 @@ class TestInvariantsAndHonesty:
         caps = r.json()["capabilities"]
         expected = {"asset_registry": "REAL", "maker_checker": "REAL", "recovery_engine": "REAL",
                     "reconciliation": "REAL", "settlement_engine": "PARTIAL", "outbox_events": "PARTIAL",
-                    "monetary_precision": "PARTIAL", "provider_adapters": "MOCK",
+                    "monetary_precision": "REAL", "provider_adapters": "MOCK",
                     "payments_deposit_stripe": "SANDBOX", "card_issuing": "MOCK",
                     "invest": "PLANNED", "crypto": "PLANNED", "fx": "PLANNED"}
         for k, v in expected.items():

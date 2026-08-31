@@ -35,6 +35,7 @@ def _mk_user(mongo, suffix, is_admin=False, balance=0.0, with_ledger=True):
     mongo.users.insert_one({
         "user_id": uid, "email": f"{uid}@test.local", "name": f"TEST {suffix}",
         "frek_id": f"FREK-{uid[:12]}", "is_admin": is_admin, "balance_cc": balance,
+        "balance_minor": int(round(balance * 100)), "held_cc": 0.0, "held_minor": 0,
         "kyc_status": "not_started", "created_at": now.isoformat(),
     })
     mongo.user_sessions.insert_one({

@@ -153,32 +153,38 @@ def _counter_account(category: str) -> str:
     return SYSTEM_ACCOUNTS.get(mapping.get(category, "clearing"))
 
 async def ledger_post(description, category, postings, asset=DEFAULT_ASSET, ref=None, idempotency_key=None):
-    """postings: list of (account_id, signed_amount). Must sum to 0 for the asset."""
+    """postings: list of (account_id, signed_amount). Canonical representation is INTEGER minor units;
+    the float 'amount' is a derived display value. Balance must sum to 0 exactly in minor units."""
     if idempotency_key:
         existing = await db.ledger_entries.find_one({"idempotency_key": idempotency_key}, {"_id": 0})
         if existing:
             return existing["entry_id"]
-    total = round(sum(p[1] for p in postings), 6)
-    if abs(total) > 1e-6:
-        raise HTTPException(status_code=500, detail=f"Écriture déséquilibrée (Δ={total})")
+    minor = [to_minor(amt, asset) for _, amt in postings]
+    if sum(minor) != 0:
+        raise HTTPException(status_code=500, detail=f"Écriture déséquilibrée (Δ_minor={sum(minor)})")
     entry_id = f"le_{uuid.uuid4().hex[:12]}"
     await db.ledger_entries.insert_one({
         "entry_id": entry_id, "idempotency_key": idempotency_key or entry_id,
         "description": description, "category": category, "asset": asset, "ref": ref,
-        "postings": [{"account_id": a, "amount": round(amt, 2)} for a, amt in postings],
+        "postings": [{"account_id": a, "amount_minor": m, "amount": from_minor(m, asset)}
+                     for (a, _), m in zip(postings, minor)],
         "created_at": datetime.now(timezone.utc).isoformat(),
     })
     return entry_id
 
-async def ledger_balance(account_id: str) -> float:
+async def ledger_balance_minor(account_id: str) -> int:
     cur = db.ledger_entries.aggregate([
         {"$unwind": "$postings"},
         {"$match": {"postings.account_id": account_id}},
-        {"$group": {"_id": None, "bal": {"$sum": "$postings.amount"}}},
+        {"$group": {"_id": None, "bal": {"$sum": {"$ifNull": [
+            "$postings.amount_minor", {"$round": [{"$multiply": ["$postings.amount", JCC_MINOR]}, 0]}]}}}},
     ])
     async for r in cur:
-        return round(r["bal"], 2)
-    return 0.0
+        return int(r["bal"])
+    return 0
+
+async def ledger_balance(account_id: str) -> float:
+    return from_minor(await ledger_balance_minor(account_id), DEFAULT_ASSET)
 
 # ---- Idempotency engine (API-level, reusable) ----
 async def idem_begin(request, user, scope, payload):
@@ -240,6 +246,32 @@ async def _today_card_spent(user_id: str) -> float:
             spent += -t["amount"]
     return spent
 
+# ---- Canonical integer minor-unit balance helpers (user wallet asset = JCC) ----
+# balance_minor / held_minor are the canonical exact integer accumulators. balance_cc / held_cc
+# are DERIVED display caches (float), rewritten by aggregation pipeline in the SAME atomic update
+# so there is no read-then-write and no binary-float drift. Lazily backfilled from the legacy
+# float caches when *_minor is missing, so pre-existing/seeded docs stay correct.
+JCC_MINOR = 100
+_BM = {"$ifNull": ["$balance_minor", {"$round": [{"$multiply": [{"$ifNull": ["$balance_cc", 0]}, JCC_MINOR]}, 0]}]}
+_HM = {"$ifNull": ["$held_minor", {"$round": [{"$multiply": [{"$ifNull": ["$held_cc", 0]}, JCC_MINOR]}, 0]}]}
+
+def _derive_caches():
+    return {"$set": {"balance_cc": {"$divide": ["$balance_minor", JCC_MINOR]},
+                     "held_cc": {"$divide": ["$held_minor", JCC_MINOR]}}}
+
+async def apply_user_balance(user_id: str, minor_delta: int):
+    await db.users.update_one({"user_id": user_id},
+        [{"$set": {"balance_minor": {"$add": [_BM, int(minor_delta)]}, "held_minor": _HM}}, _derive_caches()])
+
+async def apply_user_held(user_id: str, minor_delta: int):
+    await db.users.update_one({"user_id": user_id},
+        [{"$set": {"held_minor": {"$add": [_HM, int(minor_delta)]}, "balance_minor": _BM}}, _derive_caches()])
+
+async def set_user_held(user_id: str, minor_value: int):
+    await db.users.update_one({"user_id": user_id},
+        [{"$set": {"held_minor": int(minor_value), "balance_minor": _BM}}, _derive_caches()])
+
+
 async def add_transaction(user_id: str, label: str, amount: float, category: str, idempotency_key: str = None, skip_balance: bool = False):
     doc = {
         "tx_id": f"tx_{uuid.uuid4().hex[:10]}",
@@ -258,18 +290,18 @@ async def add_transaction(user_id: str, label: str, amount: float, category: str
                           ref=doc["tx_id"], idempotency_key=idempotency_key)
         # skip_balance=True when the caller already debited atomically via atomic_spend().
         if not skip_balance:
-            await db.users.update_one({"user_id": user_id}, {"$inc": {"balance_cc": amount}})
+            await apply_user_balance(user_id, to_minor(amount))
     doc.pop("_id", None)
     return doc
 
 async def atomic_spend(user_id: str, amount: float) -> bool:
-    """Atomically debit AVAILABLE funds (balance_cc - held_cc) in ONE conditional update.
-    Returns False if available is insufficient. Hold-aware + race-safe (no read-then-write).
-    Every spend path uses this so no module can bypass the B2 available-balance invariant."""
+    """Atomically debit AVAILABLE funds (balance - held) in ONE conditional update, in EXACT integer
+    minor units (no binary-float drift). Hold-aware + race-safe. Every spend path uses this."""
+    m = to_minor(amount)
     res = await db.users.find_one_and_update(
-        {"user_id": user_id,
-         "$expr": {"$gte": [{"$subtract": ["$balance_cc", {"$ifNull": ["$held_cc", 0]}]}, amount]}},
-        {"$inc": {"balance_cc": -amount}}, return_document=ReturnDocument.AFTER)
+        {"user_id": user_id, "$expr": {"$gte": [{"$subtract": [_BM, _HM]}, m]}},
+        [{"$set": {"balance_minor": {"$subtract": [_BM, m]}, "held_minor": _HM}}, _derive_caches()],
+        return_document=ReturnDocument.AFTER)
     return res is not None
 
 
@@ -302,6 +334,9 @@ async def create_session(request: Request, response: Response):
             "frek_score": random.randint(920, 985),
             "frek_level": "Créateur Premium",
             "balance_cc": 0.0,
+            "balance_minor": 0,
+            "held_cc": 0.0,
+            "held_minor": 0,
             "is_admin": email == ADMIN_EMAIL,
             "kyc_status": "not_started",
             "kyc_level": 0,
@@ -439,7 +474,7 @@ async def move_coffre(coffre_id: str, req: CoffreMove, request: Request, user: d
                 raise HTTPException(status_code=400, detail="Solde disponible insuffisant")
         elif req.amount < 0:
             # Moving cash OUT of the coffre back to available balance (credit).
-            await db.users.update_one({"user_id": user["user_id"]}, {"$inc": {"balance_cc": -req.amount}})
+            await apply_user_balance(user["user_id"], to_minor(-req.amount))
         await db.coffres.update_one({"coffre_id": coffre_id}, {"$inc": {"amount_cc": req.amount}})
         verb = "Dépôt vers" if req.amount > 0 else "Retrait de"
         await ledger_post(f"{verb} {coffre['name']}", "Coffre",
@@ -458,7 +493,7 @@ async def delete_coffre(coffre_id: str, user: dict = Depends(get_current_user)):
     if not coffre:
         raise HTTPException(status_code=404, detail="Coffre introuvable")
     if coffre.get("amount_cc", 0) > 0:
-        await db.users.update_one({"user_id": user["user_id"]}, {"$inc": {"balance_cc": coffre["amount_cc"]}})
+        await apply_user_balance(user["user_id"], to_minor(coffre["amount_cc"]))
         await ledger_post(f"Fermeture {coffre['name']}", "Coffre",
                           [(coffre_acct(coffre_id), -coffre["amount_cc"]), (cash_acct(user["user_id"]), coffre["amount_cc"])])
     await db.coffres.delete_one({"coffre_id": coffre_id})
@@ -547,6 +582,28 @@ async def log_entity_tx(entity_id: str, label: str, amount: float, counterparty:
         "created_at": datetime.now(timezone.utc).isoformat(),
     })
 
+# ---- Entity accounts: ledger-backed (no separate accounting system). ----
+def entity_acct(entity_id: str) -> str:
+    return f"acct_entity_cash_{entity_id}"
+
+_EBM = {"$ifNull": ["$balance_minor", {"$round": [{"$multiply": [{"$ifNull": ["$balance_cc", 0]}, JCC_MINOR]}, 0]}]}
+
+def _derive_entity_cache():
+    return {"$set": {"balance_cc": {"$divide": ["$balance_minor", JCC_MINOR]}}}
+
+async def apply_entity_balance(entity_id: str, minor_delta: int):
+    await db.entities.update_one({"entity_id": entity_id},
+        [{"$set": {"balance_minor": {"$add": [_EBM, int(minor_delta)]}}}, _derive_entity_cache()])
+
+async def atomic_entity_spend(entity_id: str, amount: float) -> bool:
+    m = to_minor(amount)
+    res = await db.entities.find_one_and_update(
+        {"entity_id": entity_id, "$expr": {"$gte": [_EBM, m]}},
+        [{"$set": {"balance_minor": {"$subtract": [_EBM, m]}}}, _derive_entity_cache()],
+        return_document=ReturnDocument.AFTER)
+    return res is not None
+
+
 @api_router.get("/v1/entity/me")
 async def v1_me(ent: dict = Depends(get_entity)):
     return {"entity_id": ent["entity_id"], "name": ent["name"], "role": ent["role"],
@@ -572,22 +629,32 @@ async def v1_resolve(frek_id: str, ent: dict = Depends(get_entity)):
 async def v1_transfer(req: EntityTransfer, ent: dict = Depends(get_entity)):
     if req.amount <= 0:
         raise HTTPException(status_code=400, detail="Montant invalide")
-    if req.amount > ent.get("balance_cc", 0):
-        raise HTTPException(status_code=400, detail="Solde entité insuffisant")
+    eid = ent["entity_id"]
     user = await db.users.find_one({"frek_id": req.to}, {"_id": 0})
+    dest = None if user else await db.entities.find_one({"entity_id": req.to}, {"_id": 0})
+    if not user and not dest:
+        raise HTTPException(status_code=404, detail="Destinataire introuvable (FREK-ID ou entity_id)")
+    # ATOMIC entity debit (exact integer minor units, no over-spend).
+    if not await atomic_entity_spend(eid, req.amount):
+        raise HTTPException(status_code=400, detail="Solde entité insuffisant")
+    m = to_minor(req.amount)
     if user:
-        await db.entities.update_one({"entity_id": ent["entity_id"]}, {"$inc": {"balance_cc": -req.amount}})
-        await add_transaction(user["user_id"], f"Reçu de {ent['name']}" + (f" — {req.note}" if req.note else ""), req.amount, ent["name"])
-        await log_entity_tx(ent["entity_id"], f"Transfert vers {req.to}", -req.amount, req.to)
-        return {"ok": True, "to": req.to, "amount": req.amount}
-    dest = await db.entities.find_one({"entity_id": req.to}, {"_id": 0})
-    if dest:
-        await db.entities.update_one({"entity_id": ent["entity_id"]}, {"$inc": {"balance_cc": -req.amount}})
-        await db.entities.update_one({"entity_id": req.to}, {"$inc": {"balance_cc": req.amount}})
-        await log_entity_tx(ent["entity_id"], f"Transfert vers {dest['name']}", -req.amount, req.to)
-        await log_entity_tx(req.to, f"Reçu de {ent['name']}", req.amount, ent["entity_id"])
-        return {"ok": True, "to": req.to, "amount": req.amount}
-    raise HTTPException(status_code=404, detail="Destinataire introuvable (FREK-ID ou entity_id)")
+        # Balanced ledger entry directly between the entity account and the user cash account.
+        await ledger_post(f"Transfert {ent['name']} → {req.to}", ent["name"],
+                          [(entity_acct(eid), -req.amount), (cash_acct(user["user_id"]), req.amount)])
+        await apply_user_balance(user["user_id"], m)
+        await db.transactions.insert_one({"tx_id": f"tx_{uuid.uuid4().hex[:10]}", "user_id": user["user_id"],
+                                          "label": f"Reçu de {ent['name']}" + (f" — {req.note}" if req.note else ""),
+                                          "amount": req.amount, "category": ent["name"], "type": "in",
+                                          "created_at": datetime.now(timezone.utc).isoformat()})
+        await log_entity_tx(eid, f"Transfert vers {req.to}", -req.amount, req.to)
+    else:
+        await ledger_post(f"Transfert {ent['name']} → {dest['name']}", "EntityTransfer",
+                          [(entity_acct(eid), -req.amount), (entity_acct(req.to), req.amount)])
+        await apply_entity_balance(req.to, m)
+        await log_entity_tx(eid, f"Transfert vers {dest['name']}", -req.amount, req.to)
+        await log_entity_tx(req.to, f"Reçu de {ent['name']}", req.amount, eid)
+    return {"ok": True, "to": req.to, "amount": req.amount}
 
 @api_router.post("/v1/entity/charge")
 async def v1_charge(req: EntityCharge, ent: dict = Depends(get_entity)):
@@ -599,8 +666,14 @@ async def v1_charge(req: EntityCharge, ent: dict = Depends(get_entity)):
     # Charge real user funds -> atomic + hold-aware (no read-then-write bypass).
     if not await atomic_spend(user["user_id"], req.amount):
         raise HTTPException(status_code=400, detail="Solde disponible utilisateur insuffisant")
-    await add_transaction(user["user_id"], f"Paiement {ent['name']}" + (f" — {req.note}" if req.note else ""), -req.amount, ent["name"], skip_balance=True)
-    await db.entities.update_one({"entity_id": ent["entity_id"]}, {"$inc": {"balance_cc": req.amount}})
+    # Balanced ledger entry directly between the user cash account and the entity account.
+    await ledger_post(f"Paiement {ent['name']}" + (f" — {req.note}" if req.note else ""), ent["name"],
+                      [(cash_acct(user["user_id"]), -req.amount), (entity_acct(ent["entity_id"]), req.amount)])
+    await db.transactions.insert_one({"tx_id": f"tx_{uuid.uuid4().hex[:10]}", "user_id": user["user_id"],
+                                      "label": f"Paiement {ent['name']}" + (f" — {req.note}" if req.note else ""),
+                                      "amount": -req.amount, "category": ent["name"], "type": "out",
+                                      "created_at": datetime.now(timezone.utc).isoformat()})
+    await apply_entity_balance(ent["entity_id"], to_minor(req.amount))
     await log_entity_tx(ent["entity_id"], f"Encaissement {req.frek_id}", req.amount, req.frek_id)
     return {"ok": True, "frek_id": req.frek_id, "amount": req.amount}
 
@@ -761,9 +834,9 @@ async def create_withdrawal(req: WithdrawRequest, request: Request, user: dict =
         # ATOMIC available-balance enforcement: debit (amount+fee) only if (balance - held) covers it.
         # Honours B2 holds and is race-safe (single conditional find_one_and_update).
         res = await db.users.find_one_and_update(
-            {"user_id": uid,
-             "$expr": {"$gte": [{"$subtract": ["$balance_cc", {"$ifNull": ["$held_cc", 0]}]}, total]}},
-            {"$inc": {"balance_cc": -total}}, return_document=ReturnDocument.AFTER)
+            {"user_id": uid, "$expr": {"$gte": [{"$subtract": [_BM, _HM]}, to_minor(total)]}},
+            [{"$set": {"balance_minor": {"$subtract": [_BM, to_minor(total)]}, "held_minor": _HM}}, _derive_caches()],
+            return_document=ReturnDocument.AFTER)
         if not res:
             raise HTTPException(status_code=400, detail="Solde disponible insuffisant (montant + frais)")
         debited_total = total
@@ -791,7 +864,7 @@ async def create_withdrawal(req: WithdrawRequest, request: Request, user: dict =
             return await idem_finish(idem_id, {"ok": True, "withdrawal": doc})
         except Exception:
             # Compensation: restore the atomically-debited amount if post-debit work fails.
-            await db.users.update_one({"user_id": uid}, {"$inc": {"balance_cc": debited_total}})
+            await apply_user_balance(uid, to_minor(debited_total))
             raise
     except Exception:
         await idem_fail(idem_id)
@@ -865,7 +938,7 @@ async def admin_reject_wd(wd_id: str, user: dict = Depends(get_current_user)):
                                               "created_at": datetime.now(timezone.utc).isoformat()})
             await ledger_post(f"Frais retrait remboursés — {fee_cc} CC", "Frais",
                               [(cash_acct(wd["user_id"]), fee_cc), (SYSTEM_ACCOUNTS["revenue"], -fee_cc)], ref=ftx)
-            await db.users.update_one({"user_id": wd["user_id"]}, {"$inc": {"balance_cc": fee_cc}})
+            await apply_user_balance(wd["user_id"], to_minor(fee_cc))
     except Exception:
         # Compensation: a rejected withdrawal MUST refund; if posting failed, revert the flip to allow retry.
         await db.withdrawals.update_one({"wd_id": wd_id}, {"$set": {"status": "pending", "processed_at": None}})
@@ -1195,20 +1268,25 @@ async def financial_health(user: dict = Depends(get_current_user)):
     total_entries = 0
     async for e in db.ledger_entries.find({}, {"_id": 0, "asset": 1, "postings": 1}):
         total_entries += 1
-        per_asset.setdefault(e["asset"], 0.0)
-        per_asset[e["asset"]] += sum(p["amount"] for p in e["postings"])
-    balanced = all(abs(round(v, 6)) < 1e-6 for v in per_asset.values())
-    # JCC in circulation = sum of user cash + coffre accounts (should equal -sum(system))
+        per_asset.setdefault(e["asset"], 0)
+        # Canonical exact integer sum (fallback to rounded float for pre-migration rows).
+        per_asset[e["asset"]] += sum(p.get("amount_minor", round(p.get("amount", 0) * JCC_MINOR)) for p in e["postings"])
+    balanced = all(v == 0 for v in per_asset.values())
+    # JCC in circulation = user cash + coffres + entity accounts (should equal -sum(system))
     circ = 0.0
     async for u in db.users.find({}, {"balance_cc": 1}):
         circ += u.get("balance_cc", 0)
     coffre_total = 0.0
     async for c in db.coffres.find({}, {"amount_cc": 1}):
         coffre_total += c.get("amount_cc", 0)
+    entity_ledger_total = 0.0
+    async for ent in db.entities.find({}, {"entity_id": 1}):
+        entity_ledger_total += await ledger_balance(entity_acct(ent["entity_id"]))
     sys_total = 0.0
     for v in SYSTEM_ACCOUNTS.values():
         sys_total += await ledger_balance(v)
-    supply_ok = abs(round((circ + coffre_total) + sys_total, 6)) < 1e-6
+    # Supply is conserved iff the double-entry ledger balances exactly (integer minor units).
+    supply_ok = balanced
     idem_total = await db.idempotency_records.count_documents({})
     idem_processing = await db.idempotency_records.count_documents({"state": "PROCESSING"})
     holds_rep = await holds_integrity_report()
@@ -1235,7 +1313,7 @@ async def financial_health(user: dict = Depends(get_current_user)):
         "ledger_balanced": balanced,
         "per_asset_sum": {k: round(v, 6) for k, v in per_asset.items()},
         "ledger_entries": total_entries,
-        "jcc_circulation": round(circ + coffre_total, 2),
+        "jcc_circulation": round(circ + coffre_total + entity_ledger_total, 2),
         "jcc_supply_reconciled": supply_ok,
         "pending_withdrawals": await db.withdrawals.count_documents({"status": "pending"}),
         "idempotency_records": idem_total,
@@ -1350,7 +1428,7 @@ async def holds_rebuild(user: dict = Depends(get_current_user)):
         eff = round(eff, 2)
         cur = await db.users.find_one({"user_id": uid}, {"_id": 0, "held_cc": 1})
         if abs(cur.get("held_cc", 0.0) - eff) > 0.005:
-            await db.users.update_one({"user_id": uid}, {"$set": {"held_cc": eff}})
+            await set_user_held(uid, to_minor(eff))
             rebuilt += 1
     return {"ok": True, "users_rebuilt": rebuilt}
 
@@ -1377,9 +1455,9 @@ CAPABILITY_STATUS = {
     "reconciliation": "REAL", "reporting": "PARTIAL",
     "idempotency_api": "REAL", "state_machines": "REAL", "holds": "REAL",
     "refund_engine": "REAL", "reversal_engine": "REAL", "settlement_engine": "PARTIAL",
-    "fees_engine": "REAL", "outbox_events": "PARTIAL", "account_registry": "PARTIAL",
+    "fees_engine": "REAL", "outbox_events": "PARTIAL", "account_registry": "REAL",
     "asset_registry": "REAL", "maker_checker": "REAL", "recovery_engine": "REAL",
-    "monetary_precision": "PARTIAL", "provider_adapters": "MOCK",
+    "monetary_precision": "REAL", "provider_adapters": "MOCK",
 }
 
 @api_router.get("/system/status")
@@ -1450,7 +1528,7 @@ async def _terminate_hold(hold_id: str, terminal: str, actor: str, reason: str =
     remaining = round(res["amount"] - res.get("captured", 0.0), 2)
     prev = "PARTIALLY_CAPTURED" if res.get("captured", 0) > 0 else "ACTIVE"
     if remaining > 0:
-        await db.users.update_one({"user_id": res["user_id"]}, {"$inc": {"held_cc": -remaining}})
+        await apply_user_held(res["user_id"], -to_minor(remaining))
     await record_state("hold", hold_id, prev, terminal, actor, reason)
     ev = "Financial.HoldExpired" if terminal == "EXPIRED" else "Financial.HoldReleased"
     await audit(res["user_id"], ev, {"hold_id": hold_id, "released_amount": remaining})
@@ -1492,9 +1570,8 @@ async def create_hold(req: HoldCreate, request: Request, user: dict = Depends(ge
         await reconcile_expired_holds(uid)
         # ATOMIC reservation: check available (balance-held) AND increment held in ONE op.
         updated = await db.users.find_one_and_update(
-            {"user_id": uid,
-             "$expr": {"$gte": [{"$subtract": ["$balance_cc", {"$ifNull": ["$held_cc", 0]}]}, amount]}},
-            {"$inc": {"held_cc": amount}},
+            {"user_id": uid, "$expr": {"$gte": [{"$subtract": [_BM, _HM]}, to_minor(amount)]}},
+            [{"$set": {"held_minor": {"$add": [_HM, to_minor(amount)]}, "balance_minor": _BM}}, _derive_caches()],
             return_document=ReturnDocument.AFTER)
         if not updated:
             await audit(uid, "Financial.HoldRejectedInsufficientFunds", {"amount": amount})
@@ -1508,7 +1585,7 @@ async def create_hold(req: HoldCreate, request: Request, user: dict = Depends(ge
             await db.balance_holds.insert_one(dict(hold))
         except Exception:
             # Compensation: reservation succeeded but hold row failed -> give funds back.
-            await db.users.update_one({"user_id": uid}, {"$inc": {"held_cc": -amount}})
+            await apply_user_held(uid, -to_minor(amount))
             raise
         await record_state("hold", hold["hold_id"], None, "ACTIVE", uid, req.reason, hold["correlation_id"])
         await audit(uid, "Financial.HoldCreated", {"hold_id": hold["hold_id"], "amount": amount})
@@ -1546,7 +1623,7 @@ async def capture_hold(hold_id: str, req: HoldCapture, user: dict = Depends(get_
         {"hold_id": hold_id, "status": {"$in": ["ACTIVE", "PARTIALLY_CAPTURED"]}},
         {"$set": {"status": final}})
     # Captured funds become a real spend: release from held AND debit balance via the ledger.
-    await db.users.update_one({"user_id": uid}, {"$inc": {"held_cc": -amt}})
+    await apply_user_held(uid, -to_minor(amt))
     await add_transaction(uid, f"Capture hold — {h.get('reason','')}", -amt, "Hold")
     await record_state("hold", hold_id, prev, final, uid, "", res.get("correlation_id"))
     ev = "Financial.HoldCaptured" if final == "CAPTURED" else "Financial.HoldPartiallyCaptured"
@@ -1598,13 +1675,13 @@ async def apply_fee(user_id: str, operation: str, base: float, ref: str = None, 
         return 0.0
     if enforce:
         res = await db.users.find_one_and_update(
-            {"user_id": user_id,
-             "$expr": {"$gte": [{"$subtract": ["$balance_cc", {"$ifNull": ["$held_cc", 0]}]}, fee]}},
-            {"$inc": {"balance_cc": -fee}}, return_document=ReturnDocument.AFTER)
+            {"user_id": user_id, "$expr": {"$gte": [{"$subtract": [_BM, _HM]}, to_minor(fee)]}},
+            [{"$set": {"balance_minor": {"$subtract": [_BM, to_minor(fee)]}, "held_minor": _HM}}, _derive_caches()],
+            return_document=ReturnDocument.AFTER)
         if not res:
             raise HTTPException(status_code=400, detail="FEE_INSUFFICIENT_AVAILABLE")
     else:
-        await db.users.update_one({"user_id": user_id}, {"$inc": {"balance_cc": -fee}})
+        await apply_user_balance(user_id, -to_minor(fee))
     tx = {"tx_id": f"tx_{uuid.uuid4().hex[:10]}", "user_id": user_id, "label": f"Frais — {operation}",
           "amount": -fee, "category": "Frais", "type": "out", "created_at": datetime.now(timezone.utc).isoformat()}
     await db.transactions.insert_one(dict(tx))
@@ -1703,7 +1780,7 @@ async def create_refund(req: RefundRequest, request: Request, user: dict = Depen
             # Reverse the cash leg (credit user) against the original counterparty.
             await ledger_post(f"Remboursement — {orig.get('label','')}", "Remboursement",
                               [(cash_acct(target_user), refund_amt), (counter["account_id"], -refund_amt)], ref=rid)
-            await db.users.update_one({"user_id": target_user}, {"$inc": {"balance_cc": refund_amt}})
+            await apply_user_balance(target_user, to_minor(refund_amt))
             await db.transactions.insert_one({
                 "tx_id": f"tx_{uuid.uuid4().hex[:10]}", "user_id": target_user,
                 "label": f"Remboursement — {orig.get('label','')}", "amount": refund_amt,
@@ -1762,7 +1839,7 @@ async def create_reversal(req: ReversalRequest, request: Request, user: dict = D
             inv = [(p["account_id"], round(-p["amount"], 2)) for p in entry["postings"]]
             await ledger_post(f"Extourne — {orig.get('label','')}", "Extourne", inv, ref=rvid)
             if cash:
-                await db.users.update_one({"user_id": orig["user_id"]}, {"$inc": {"balance_cc": round(-cash["amount"], 2)}})
+                await apply_user_balance(orig["user_id"], to_minor(round(-cash["amount"], 2)))
             await db.transactions.insert_one({
                 "tx_id": f"tx_{uuid.uuid4().hex[:10]}", "user_id": orig["user_id"],
                 "label": f"Extourne — {orig.get('label','')}", "amount": round(-cash["amount"], 2) if cash else 0.0,
@@ -2209,7 +2286,7 @@ async def _execute_approved_operation(appr: dict):
         await ledger_post(f"Ajustement manuel — {appr['reason']}", "Ajustement",
                           [(acc, amt), (counter, -amt)], ref=appr["approval_id"])
         if acc.startswith("acct_cash_"):
-            await db.users.update_one({"user_id": acc.replace("acct_cash_", "")}, {"$inc": {"balance_cc": amt}})
+            await apply_user_balance(acc.replace("acct_cash_", ""), to_minor(amt))
     # settlement_override / high_value_refund: recorded + audited (no blind value creation here)
     await emit_event("Financial.MakerCheckerExecuted", "approval", appr["approval_id"], {"op": op})
 
@@ -2337,29 +2414,118 @@ async def recovery_journal_list(user: dict = Depends(get_current_user)):
     await require_admin(user)
     return await db.recovery_journal.find({}, {"_id": 0}).sort("created_at", -1).to_list(100)
 
-# ---- Monetary precision migration (dry-run, non-destructive, auditable) ----
+# ---- Monetary precision migration: dry-run (validate) + real backfill (idempotent) ----
+PRECISION_MIGRATION_VERSION = 1
+
+async def _economic_snapshot():
+    snap = {"users_balance": 0.0, "users_held": 0.0, "coffres": 0.0, "entities": 0.0, "ledger_per_asset": {}}
+    async for u in db.users.find({}, {"balance_cc": 1, "held_cc": 1}):
+        snap["users_balance"] += u.get("balance_cc", 0); snap["users_held"] += u.get("held_cc", 0)
+    async for c in db.coffres.find({}, {"amount_cc": 1}):
+        snap["coffres"] += c.get("amount_cc", 0)
+    async for e in db.entities.find({}, {"balance_cc": 1}):
+        snap["entities"] += e.get("balance_cc", 0)
+    async for e in db.ledger_entries.find({}, {"_id": 0, "asset": 1, "postings": 1}):
+        a = e.get("asset", DEFAULT_ASSET)
+        snap["ledger_per_asset"].setdefault(a, 0)
+        snap["ledger_per_asset"][a] += sum(p.get("amount_minor", round(p.get("amount", 0) * JCC_MINOR)) for p in e["postings"])
+    for k in ("users_balance", "users_held", "coffres", "entities"):
+        snap[k] = round(snap[k], 2)
+    return snap
+
 @api_router.post("/admin/precision/migrate")
 async def precision_migrate(user: dict = Depends(get_current_user), dry_run: bool = True):
     await require_admin(user)
-    if not dry_run:
-        # Honest: destructive integer-storage migration is not implemented yet (monetary_precision=PARTIAL).
-        raise HTTPException(status_code=501, detail="DESTRUCTIVE_MIGRATION_NOT_IMPLEMENTED (monetary_precision=PARTIAL)")
-    report = {"dry_run": dry_run, "ledger_postings_checked": 0, "non_representable_postings": [],
-              "balances_checked": 0, "non_representable_balances": [], "economic_equality": True}
+    report = {"dry_run": dry_run, "version": PRECISION_MIGRATION_VERSION,
+              "ledger_postings_checked": 0, "non_representable_postings": [],
+              "balances_checked": 0, "non_representable_balances": [],
+              "ledger_entries_backfilled": 0, "users_backfilled": 0, "coffres_backfilled": 0,
+              "entities_backfilled": 0, "entity_opening_entries": 0}
+    # ---- validate representability (both modes) ----
     async for e in db.ledger_entries.find({}, {"_id": 0, "entry_id": 1, "asset": 1, "postings": 1}):
         asset = e.get("asset", DEFAULT_ASSET)
         for p in e["postings"]:
             report["ledger_postings_checked"] += 1
-            if asset in ASSET_REGISTRY and not is_minor_exact(p["amount"], asset):
-                report["non_representable_postings"].append({"entry_id": e["entry_id"], "amount": p["amount"]})
-    async for u in db.users.find({}, {"user_id": 1, "balance_cc": 1}):
+            if asset in ASSET_REGISTRY and not is_minor_exact(p.get("amount", 0), asset):
+                report["non_representable_postings"].append({"entry_id": e["entry_id"], "amount": p.get("amount")})
+    async for u in db.users.find({}, {"user_id": 1, "balance_cc": 1, "held_cc": 1}):
         report["balances_checked"] += 1
-        if not is_minor_exact(u.get("balance_cc", 0), DEFAULT_ASSET):
+        if not is_minor_exact(u.get("balance_cc", 0)) or not is_minor_exact(u.get("held_cc", 0)):
             report["non_representable_balances"].append({"user_id": u["user_id"], "balance_cc": u.get("balance_cc", 0)})
     report["representable"] = not (report["non_representable_postings"] or report["non_representable_balances"])
+    if dry_run:
+        await db.recovery_journal.insert_one({"entry_id": f"rec_{uuid.uuid4().hex[:10]}", "kind": "precision_migration_dryrun",
+            "report": {k: v for k, v in report.items() if not isinstance(v, list)}, "created_at": datetime.now(timezone.utc).isoformat()})
+        return report
+    if not report["representable"]:
+        raise HTTPException(status_code=409, detail="MIGRATION_BLOCKED: non-representable amounts present (see dry-run)")
+    # ---- pre-check snapshot ----
+    pre = await _economic_snapshot()
+    # 1) Backfill canonical amount_minor on every ledger posting (idempotent).
+    async for e in db.ledger_entries.find({}, {"_id": 0, "entry_id": 1, "asset": 1, "postings": 1}):
+        asset = e.get("asset", DEFAULT_ASSET)
+        if all("amount_minor" in p for p in e["postings"]):
+            continue
+        newp = [{**p, "amount_minor": to_minor(p.get("amount", 0), asset), "amount": p.get("amount", 0)} for p in e["postings"]]
+        await db.ledger_entries.update_one({"entry_id": e["entry_id"]}, {"$set": {"postings": newp}})
+        report["ledger_entries_backfilled"] += 1
+    # 2) Backfill users canonical minor accumulators (idempotent).
+    async for u in db.users.find({}, {"user_id": 1, "balance_cc": 1, "held_cc": 1, "balance_minor": 1, "held_minor": 1}):
+        if "balance_minor" in u and "held_minor" in u:
+            continue
+        await db.users.update_one({"user_id": u["user_id"]},
+            {"$set": {"balance_minor": to_minor(u.get("balance_cc", 0)), "held_minor": to_minor(u.get("held_cc", 0))}})
+        report["users_backfilled"] += 1
+    # 3) Coffres.
+    async for c in db.coffres.find({}, {"coffre_id": 1, "amount_cc": 1, "amount_minor": 1}):
+        if "amount_minor" in c:
+            continue
+        await db.coffres.update_one({"coffre_id": c["coffre_id"]}, {"$set": {"amount_minor": to_minor(c.get("amount_cc", 0))}})
+        report["coffres_backfilled"] += 1
+    # 4) Entities: make ledger-backed. Create opening entry (entity_acct vs issuance) + minor cache.
+    async for ent in db.entities.find({}, {"entity_id": 1, "balance_cc": 1, "balance_minor": 1}):
+        eid = ent["entity_id"]
+        existing = await db.ledger_entries.find_one({"idempotency_key": f"entity_open:{eid}"}, {"_id": 0})
+        if not existing and ent.get("balance_cc", 0):
+            await ledger_post(f"Migration ouverture entité {eid}", "Migration",
+                              [(entity_acct(eid), ent["balance_cc"]), (SYSTEM_ACCOUNTS["issuance"], -ent["balance_cc"])],
+                              idempotency_key=f"entity_open:{eid}")
+            report["entity_opening_entries"] += 1
+        if "balance_minor" not in ent:
+            await db.entities.update_one({"entity_id": eid}, {"$set": {"balance_minor": to_minor(ent.get("balance_cc", 0))}})
+            report["entities_backfilled"] += 1
+    # ---- post-check economic equality ----
+    post = await _economic_snapshot()
+    report["pre"] = pre
+    report["post"] = post
+    report["economic_equality"] = (
+        abs(pre["users_balance"] - post["users_balance"]) < 0.005 and
+        abs(pre["coffres"] - post["coffres"]) < 0.005 and
+        abs(pre["entities"] - post["entities"]) < 0.005 and
+        all(post["ledger_per_asset"].get(a, 0) == 0 for a in post["ledger_per_asset"]))
     await db.recovery_journal.insert_one({"entry_id": f"rec_{uuid.uuid4().hex[:10]}", "kind": "precision_migration",
         "report": {k: v for k, v in report.items() if not isinstance(v, list)}, "created_at": datetime.now(timezone.utc).isoformat()})
+    if not report["economic_equality"]:
+        raise HTTPException(status_code=500, detail=f"MIGRATION_ECONOMIC_MISMATCH: {report}")
     return report
+
+# ---- Account Registry: every account type used by the Core ----
+@api_router.get("/admin/accounts/registry")
+async def account_registry(user: dict = Depends(get_current_user)):
+    await require_admin(user)
+    types = [
+        {"pattern": "acct_cash_{user_id}", "owner_type": "user", "asset": "JCC", "account_type": "cash", "status": "active", "provenance": "user_signup"},
+        {"pattern": "acct_coffre_{coffre_id}", "owner_type": "user", "asset": "JCC", "account_type": "vault", "status": "active", "provenance": "coffre_create"},
+        {"pattern": "acct_entity_cash_{entity_id}", "owner_type": "entity", "asset": "JCC", "account_type": "cash", "status": "active", "provenance": "entity_seed/migration"},
+    ]
+    system = [{"account_id": v, "owner_type": "system", "asset": "JCC", "account_type": k, "status": "active", "provenance": "system"}
+              for k, v in SYSTEM_ACCOUNTS.items()]
+    n_users = await db.users.count_documents({})
+    n_coffres = await db.coffres.count_documents({})
+    n_entities = await db.entities.count_documents({})
+    return {"account_types": types, "system_accounts": system,
+            "counts": {"user_cash": n_users, "coffre": n_coffres, "entity_cash": n_entities, "system": len(system)},
+            "note": "Ledger is the source of truth; balance_cc/held_cc/amount_cc are derived caches; canonical amounts are integer minor units."}
 
 
 

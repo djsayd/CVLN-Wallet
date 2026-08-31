@@ -285,10 +285,12 @@ class TestRecoveryClassification:
 # ---------------- FIX 5: precision honesty ----------------
 class TestPrecisionHonesty:
     def test_destructive_migration_501(self, api, adm):
+        # Real migration is now implemented: dry_run=false performs an idempotent backfill
+        # and returns economic_equality=True (no more 501).
         r = api.post(f"{BASE_URL}/api/admin/precision/migrate?dry_run=false",
                      headers=auth(adm["token"]), timeout=120)
-        assert r.status_code == 501, (r.status_code, r.text[:300])
-        assert "DESTRUCTIVE_MIGRATION_NOT_IMPLEMENTED" in r.text, r.text[:200]
+        assert r.status_code == 200, (r.status_code, r.text[:300])
+        assert r.json()["economic_equality"] is True, r.text[:300]
 
     def test_dry_run_still_reports(self, api, adm):
         r = api.post(f"{BASE_URL}/api/admin/precision/migrate?dry_run=true",
@@ -407,7 +409,7 @@ class TestFinalInvariants:
         caps = r.json()["capabilities"]
         expected = {"asset_registry": "REAL", "maker_checker": "REAL", "recovery_engine": "REAL",
                     "reconciliation": "REAL", "settlement_engine": "PARTIAL", "outbox_events": "PARTIAL",
-                    "monetary_precision": "PARTIAL", "provider_adapters": "MOCK", "card_issuing": "MOCK",
+                    "monetary_precision": "REAL", "provider_adapters": "MOCK", "card_issuing": "MOCK",
                     "payments_deposit_stripe": "SANDBOX"}
         for k, v in expected.items():
             got = caps.get(k) if not isinstance(caps.get(k), dict) else caps[k].get("status")

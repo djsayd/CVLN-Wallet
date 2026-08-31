@@ -39,7 +39,7 @@ def reset_state(mongo, uid, balance=100.0):
     mongo.balance_holds.delete_many({"user_id": uid})
     if hold_ids:
         mongo.financial_state_history.delete_many({"entity_type": "hold", "entity_id": {"$in": hold_ids}})
-    mongo.users.update_one({"user_id": uid}, {"$set": {"held_cc": 0.0, "balance_cc": balance}})
+    mongo.users.update_one({"user_id": uid}, {"$set": {"held_cc": 0.0, "held_minor": 0, "balance_cc": balance, "balance_minor": int(round(balance * 100))}})
     # keep the ledger consistent with the reset cache
     mongo.ledger_entries.delete_many({"postings.account_id": f"acct_cash_{uid}"})
     mongo.transactions.delete_many({"user_id": uid})

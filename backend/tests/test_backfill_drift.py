@@ -67,7 +67,7 @@ def test_backfill_cannot_fix_a_second_drift_on_same_account(api, admin_user, dri
     assert _integrity(api, h)["cache_mismatches"] == []
 
     # new drift appears on the same account
-    mongo.users.update_one({"user_id": uid}, {"$set": {"balance_cc": 450.0}})
+    mongo.users.update_one({"user_id": uid}, {"$set": {"balance_cc": 450.0}, "$unset": {"balance_minor": ""}})
     mism = [m["user_id"] for m in _integrity(api, h)["cache_mismatches"]]
     assert uid in mism
 
