@@ -700,6 +700,27 @@ async def get_audit(user: dict = Depends(get_current_user)):
     await require_admin(user)
     return await db.audit_logs.find({}, {"_id": 0}).sort("created_at", -1).to_list(200)
 
+@api_router.get("/admin/skills")
+async def admin_skills(user: dict = Depends(get_current_user)):
+    await require_admin(user)
+    return [{"name": n, **s} for n, s in SKILLS.items()]
+
+@api_router.get("/admin/intents")
+async def admin_intents(user: dict = Depends(get_current_user)):
+    await require_admin(user)
+    return await db.agent_intents.find({}, {"_id": 0}).sort("created_at", -1).to_list(200)
+
+@api_router.post("/agent/intent/{intent_id}/decline")
+async def decline_intent(intent_id: str, user: dict = Depends(get_current_user)):
+    intent = await db.agent_intents.find_one({"intent_id": intent_id}, {"_id": 0})
+    if not intent:
+        raise HTTPException(status_code=404, detail="Intent introuvable")
+    if intent["owner_user_id"] != user["user_id"]:
+        raise HTTPException(status_code=403, detail="Refus réservé au propriétaire du wallet")
+    await db.agent_intents.update_one({"intent_id": intent_id}, {"$set": {"status": "denied", "confirmed": False}})
+    await audit(user["user_id"], "intent_declined", {"intent_id": intent_id})
+    return {"ok": True}
+
 # ---- Agent Factory discovery ----
 @api_router.get("/agent/skills")
 async def agent_skills(agent: dict = Depends(get_agent)):

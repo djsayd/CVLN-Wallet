@@ -27,3 +27,10 @@ Premium fintech wallet (Revolut/Qonto style) for CVLN Group cultural ecosystem. 
 - Flow PREPARE(/agent/intent) -> CONFIRM(owner) -> EXECUTE; risk engine + preview + audit_logs.
 - Docs: docs/AGENTSKILL-WALLET-MAPPING.md, CVLN-WALLET-AGENTS.md, CVLN-WALLET-SECURITY.md.
 - Multi-chain BTC/ETH/SOL = préparé non activé (P2). Frontend Agents UI = P1.
+
+## Update 2026-06 — Agent Factory UI (P0 closed)
+- Écran Admin /agents: onglets Agents/Skills/Intents/Audit; création agent (scopes least-privilege, plafond, TTL), révoke, simulate intent.
+- Modal de confirmation transaction (preview: agent, action, montant, destination, risque) — Confirmer/Refuser.
+- Endpoints ajoutés: GET /admin/skills, GET /admin/intents, POST /agent/intent/{id}/decline.
+- E2E navigateur OK: create->simulate->preview->confirm->execute; solde 1000->950; audit 4 events.
+- Nav admin-only: API, Agents, Admin (masqué pour users + require_admin backend).

@@ -3,7 +3,7 @@ import { useState } from "react";
 import { motion } from "framer-motion";
 import {
   House, Wallet as WalletIcon, Receipt, Vault, ArrowsLeftRight,
-  Storefront, Planet, IdentificationCard, Gear, SignOut, List, X, MagnifyingGlass, Code, ShieldStar,
+  Storefront, Planet, IdentificationCard, Gear, SignOut, List, X, MagnifyingGlass, Code, ShieldStar, Robot,
 } from "@phosphor-icons/react";
 import { useAuth } from "@/context/AuthContext";
 
@@ -21,6 +21,7 @@ const NAV = [
 
 const ADMIN_NAV = [
   { to: "/developers", label: "API", icon: Code },
+  { to: "/agents", label: "Agents", icon: Robot },
   { to: "/admin", label: "Admin", icon: ShieldStar },
 ];
 
